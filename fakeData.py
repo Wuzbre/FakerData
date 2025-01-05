@@ -4,33 +4,77 @@ from datetime import datetime, timedelta
 from faker import Faker
 from dbutils.pooled_db import PooledDB
 import pymysql
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Generator
 import holidays
+import json
+import re
+import logging
+from pathlib import Path
+from tqdm import tqdm
+from config.data_config import *
 
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('data_generation.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class DatabaseError(Exception):
+    """数据库操作错误"""
+    pass
+
+class DataValidationError(Exception):
+    """数据验证错误"""
+    pass
 
 class DataSimulator:
-    def __init__(self, db_config, start_time=None, end_time=None, frequency=1):
+    """
+    模拟生成业务数据的类。
+    支持生成用户、员工、产品、订单等相关数据。
+
+    Attributes:
+        db_config (dict): 数据库配置信息
+        start_time (datetime): 数据生成的开始时间
+        end_time (datetime): 数据生成的结束时间
+        frequency (int): 数据生成的频率(秒)
+    """
+    
+    def __init__(self, db_config: Dict[str, Any], start_time: Optional[datetime] = None,
+                 end_time: Optional[datetime] = None, frequency: int = 1):
+        """
+        初始化数据模拟器。
+        
+        Args:
+            db_config: 数据库配置
+            start_time: 开始时间
+            end_time: 结束时间
+            frequency: 生成频率
+        """
         self.db_config = db_config
-        self.fake = Faker('zh_CN')  # 使用中文数据
-        self.fake1 = Faker('en_US')
-        self.start_time = start_time if start_time else datetime.now()
-        self.end_time = end_time if end_time else self.start_time + timedelta(days=30)  # 默认30天数据
-        self.frequency = frequency  # 数据生成频率，单位：秒
-        # 初始化连接池
-        self.pool = PooledDB(
-            creator=pymysql,  # 使用 pymysql 作为数据库连接驱动
-            maxconnections=10,  # 设置最大连接数
-            mincached=2,  # 最小空闲连接数
-            maxcached=5,  # 最大空闲连接数
-            blocking=True,  # 如果没有空闲连接，是否阻塞
-            maxshared=3,  # 最大共享连接数
-            setsession=[],  # 设置数据库连接的初始化操作
-            host=self.db_config['host'],
-            user=self.db_config['user'],
-            password=self.db_config['password'],
-            database=self.db_config['database'],
-            charset=self.db_config['charset']
-        )
+        self.fake = Faker('zh_CN')
+        self.fake_en = Faker('en_US')  # 重命名为更清晰的名称
+        self.start_time = start_time or datetime.now()
+        self.end_time = end_time or (self.start_time + timedelta(days=30))
+        self.frequency = frequency
+        
+        # 初始化数据库连接池
+        self._init_db_pool()
+        
+        # 加载配置和断点信息
+        self._load_config_data()
+        self._load_checkpoint()
+        
+        # 初始化统计信息
+        self.stats = {
+            'generated': {k: 0 for k in DATA_GENERATION['base_rates'].keys()},
+            'updated': {k: 0 for k in DATA_GENERATION['base_rates'].keys()},
+            'errors': []
+        }
+
         self.brands = [
             "华为", "小米", "苹果", "三星", "荣耀", "OPPO", "vivo",  # 电子品牌
             "耐克", "阿迪达斯", "彪马", "安踏", "李宁", "New Balance",  # 运动品牌
@@ -295,35 +339,65 @@ class DataSimulator:
         return self.pool.connection()
 
 
-    def query_from_db(self, query: str) -> List[Dict[str, Any]]:
-        connection = self.connect_to_db()
+    def query_from_db(self, query: str) -> List[Any]:
+        """
+        执行数据库查询。
+        
+        Args:
+            query: SQL查询语句
+            
+        Returns:
+            查询结果列表
+            
+        Raises:
+            DatabaseError: 数据库查询失败时抛出
+        """
+        connection = None
         try:
+            connection = self.pool.connection()
             with connection.cursor(cursor=pymysql.cursors.Cursor) as cursor:
                 cursor.execute(query)
                 return [row[0] for row in cursor.fetchall()]
-        except pymysql.MySQLError as e:
-            print(f"Error querying database: {e}")
-            return []
+        except pymysql.Error as e:
+            raise DatabaseError(f"Database query failed: {e}")
         finally:
-            connection.close()
+            if connection:
+                connection.close()
 
-    def save_to_mysql(self, data: List[Dict[str, Any]], table_name: str):
+    def save_to_mysql(self, data: List[Dict[str, Any]], table_name: str) -> None:
+        """
+        批量保存数据到MySQL。
+        
+        Args:
+            data: 要保存的数据列表
+            table_name: 表名
+            
+        Raises:
+            DatabaseError: 数据保存失败时抛出
+        """
         if not data:
             return
-        connection = self.connect_to_db()
+            
+        connection = None
         try:
+            connection = self.pool.connection()
             with connection.cursor() as cursor:
                 keys = data[0].keys()
                 columns = ', '.join(keys)
                 placeholders = ', '.join(['%s'] * len(keys))
                 values = [tuple(record[key] for key in keys) for record in data]
+                
                 query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
                 cursor.executemany(query, values)
+                
             connection.commit()
-        except pymysql.MySQLError as e:
-            print(f"Error while saving data to {table_name}: {e}")
+        except pymysql.Error as e:
+            if connection:
+                connection.rollback()
+            raise DatabaseError(f"Failed to save data to {table_name}: {e}")
         finally:
-            connection.close()
+            if connection:
+                connection.close()
 
     def update_mysql(self, updates: List[Dict[str, Any]], table_name: str, primary_key: str):
         """Update data in a MySQL table."""
@@ -344,127 +418,282 @@ class DataSimulator:
         finally:
             connection.close()
 
-    def generate_daily_data(self, current_date):
-        """每日数据生成逻辑"""
+    def generate_daily_data(self, current_date: datetime) -> None:
+        """
+        生成每日数据。
+        
+        Args:
+            current_date: 当前日期
+        """
+        try:
+            # 计算增长数量
+            growth_rates = self._calculate_growth_rates(current_date)
+            
+            # 生成基础数据
+            data_generators = {
+                'users': (self.generate_user_data, growth_rates['user']),
+                'employees': (self.generate_employee_data, growth_rates['employee']),
+                'products': (self.generate_product_data, growth_rates['product']),
+                'purchase_orders': (self.generate_purchase_order_data, growth_rates['purchase_order']),
+                'sales_orders': (self.generate_sales_order_data, growth_rates['sales_order'])
+            }
+            
+            # 批量生成并保存数据
+            for table_name, (generator, count) in data_generators.items():
+                data = [generator(current_date) for _ in range(count)]
+                self.save_to_mysql(data, table_name)
+                
+            # 生成关联数据
+            self._generate_related_data(current_date, growth_rates)
+            
+            # 更新现有数据
+            self._update_existing_data(current_date)
+            
+            print(f"Successfully generated data for {current_date.strftime('%Y-%m-%d')}")
+            
+        except Exception as e:
+            print(f"Error generating data for {current_date}: {e}")
+            # 可以添加重试逻辑或告警机制
+
+    def _calculate_growth_rates(self, current_date: datetime) -> Dict[str, int]:
+        """计算各类数据的增长率"""
         is_holiday = self.is_holiday(current_date)
+        base_rates = {
+            'user': 500,
+            'employee': 1,
+            'product': 40,
+            'purchase_order': 300,
+            'sales_order': 600
+        }
+        
+        # 节假日调整
+        if is_holiday:
+            return {k: v // 2 for k, v in base_rates.items()}
+        return base_rates
 
-        # 调整每日增长数量
-        user_growth = 500 if not is_holiday else 200  # 节假日用户增长减少
-        employee_growth = 1
-        product_growth = 40 if not is_holiday else 20
-        purchase_order_growth = 300 if not is_holiday else 100
-        sales_order_growth = 600 if not is_holiday else 300
+    def _load_checkpoint(self) -> None:
+        """加载断点信息"""
+        checkpoint_file = Path('checkpoint.json')
+        if checkpoint_file.exists():
+            with open(checkpoint_file, 'r') as f:
+                checkpoint = json.load(f)
+                self.start_time = datetime.fromisoformat(checkpoint['last_date'])
+                logging.info(f"Resuming from checkpoint: {self.start_time}")
 
-        # 生成数据数量
-        # user_nums = max(1, int(random.gauss(user_growth, 10)))
-        # employee_nums = max(1, int(random.gauss(employee_growth, 1)))
-        # product_nums = max(1, int(random.gauss(product_growth, 5)))
-        # purchase_order_nums = max(1, int(random.gauss(purchase_order_growth, 20)))
-        # sales_order_nums = max(1, int(random.gauss(sales_order_growth, 30)))
+    def _save_checkpoint(self, current_date: datetime) -> None:
+        """保存断点信息"""
+        with open('checkpoint.json', 'w') as f:
+            json.dump({
+                'last_date': current_date.isoformat(),
+                'stats': self.stats
+            }, f)
 
-        user_nums = max(1, int(random.gauss(user_growth, 10)))  # 用户数量基于正态分布
-        employee_nums = max(1, int(random.gauss(employee_growth, 1)))  # 员工数量变化小
-        product_nums = max(1, int(random.gauss(product_growth, 5)))  # 产品数量基于稳定增长
-        purchase_order_data_nums = max(1, int(random.gauss(purchase_order_growth, 20)))  # 采购订单数量
-        purchase_order_item_data_nums = purchase_order_data_nums * random.randint(1, 5)  # 每个订单多个项目
-        sales_order_data_nums = max(1, int(random.gauss(sales_order_growth * 2, 30)))  # 销售订单数量更多
-        sales_order_item_data_nums = sales_order_data_nums * random.randint(1, 5)  # 每个订单多个项目
+    def _validate_data(self, data: Dict[str, Any], data_type: str) -> bool:
+        """
+        验证数据是否符合规则
+        
+        Args:
+            data: 要验证的数据
+            data_type: 数据类型（user/product等）
+            
+        Returns:
+            bool: 验证是否通过
+            
+        Raises:
+            DataValidationError: 数据验证失败时抛出
+        """
+        rules = VALIDATION_RULES.get(data_type, {})
+        
+        try:
+            if data_type == 'user':
+                if not re.match(rules['email'], data['email']):
+                    raise DataValidationError(f"Invalid email: {data['email']}")
+                if not re.match(rules['phone'], data['phone']):
+                    raise DataValidationError(f"Invalid phone: {data['phone']}")
+                if len(data['password']) < rules['password_min_length']:
+                    raise DataValidationError("Password too short")
+                    
+            elif data_type == 'product':
+                if not rules['price_min'] <= data['price'] <= rules['price_max']:
+                    raise DataValidationError(f"Price out of range: {data['price']}")
+                    
+            return True
+            
+        except DataValidationError as e:
+            self.stats['errors'].append(str(e))
+            logging.warning(f"Data validation failed: {e}")
+            return False
 
-        # 数据生成
-        user_data = [self.generate_user_data(current_date) for _ in range(user_nums)]
-        self.save_to_mysql(user_data, 'users')
+    def _generate_related_data(self, current_date: datetime, growth_rates: Dict[str, int]) -> None:
+        """生成关联数据"""
+        # 生成订单项数据
+        for order_type in ['purchase_orders', 'sales_orders']:
+            base_count = growth_rates[order_type.rstrip('s')]
+            items_count = base_count * random.randint(1, 5)
+            
+            generator = (
+                self.generate_purchase_order_item_data if 'purchase' in order_type
+                else self.generate_sales_order_item_data
+            )
+            
+            items_data = [generator(current_date) for _ in range(items_count)]
+            self.save_to_mysql(items_data, f"{order_type.rstrip('s')}_items")
+            
+            self.stats['generated'][f"{order_type.rstrip('s')}_items"] = items_count
 
-        employee_data = [self.generate_employee_data(current_date) for _ in range(employee_nums)]
-        self.save_to_mysql(employee_data, 'employees')
+    def _update_existing_data(self, current_date: datetime) -> None:
+        """更新现有数据"""
+        for table, id_field in [
+            ('users', 'user_id'),
+            ('employees', 'employee_id'),
+            ('products', 'product_id')
+        ]:
+            ids = self.query_from_db(f"SELECT {id_field} FROM {table} WHERE status <> 'deleted'")
+            if not ids:
+                continue
+                
+            update_count = min(len(ids), max(1, len(ids) * random.randint(1, 5) // 100))
+            updates = self._generate_updates(table, ids, update_count, current_date)
+            
+            self.update_mysql(updates, table, id_field)
+            self.stats['updated'][table] = update_count
 
-        product_data = [self.generate_product_data(current_date) for _ in range(product_nums)]
-        self.save_to_mysql(product_data, 'products')
-
-        purchase_order_data = [self.generate_purchase_order_data(current_date) for _ in range(purchase_order_data_nums)]
-        self.save_to_mysql(purchase_order_data, 'purchase_orders')
-
-        purchase_order_item_data = [self.generate_purchase_order_item_data(current_date) for _ in
-                                    range(purchase_order_item_data_nums)]
-        self.save_to_mysql(purchase_order_item_data, 'purchase_order_items')
-
-        sales_order_data = [self.generate_sales_order_data(current_date) for _ in range(sales_order_data_nums)]
-        self.save_to_mysql(sales_order_data, 'sales_orders')
-
-        sales_order_item_data = [self.generate_sales_order_item_data(current_date) for _ in
-                                 range(sales_order_item_data_nums)]
-        self.save_to_mysql(sales_order_item_data, 'sales_order_items')
-        # 保存数据到数据库
-
-        print(f"生成日期 {current_date.strftime('%Y-%m-%d')} 数据: "
-              f"用户({user_nums})，员工({employee_nums})，产品({product_nums})，"
-              f"采购订单({purchase_order_data_nums})，采购子订单({purchase_order_item_data_nums})，销售订单({sales_order_data_nums})，"
-              f"销售子订单({sales_order_item_data_nums})")
-
-        # 更新数量动态控制为现有数据量的 1% 到 5%
-        user_ids = self.query_from_db("SELECT user_id FROM users where status <> 'deleted'")
-        employee_ids = self.query_from_db("SELECT employee_id FROM employees")
-        product_ids = self.query_from_db("SELECT product_id FROM products")
-
-        user_nums_update = min(len(user_ids), max(1, len(user_ids) * random.randint(1, 5) // 100))
-        employee_nums_update = min(len(employee_ids), max(1, len(employee_ids) * random.randint(1, 3) // 100))
-        product_nums_update = min(len(product_ids), max(1, len(product_ids) * random.randint(1, 5) // 100))
-
-        # 更新数据逻辑
-        if user_ids:
-            updates_users = [{
-                "user_id": random.choice(user_ids),
-                "nickname": self.fake.first_name(),
-                "email": self.fake.email(),
-                "status": random.choice(["deleted", "active"]),
-                "last_login": self.fake.date_time_between(current_date,
-                                                          current_date + timedelta(days=1)) + timedelta(
-                    days=random.randint(1, 10))
-            } for _ in range(user_nums_update)]
-            self.update_mysql(updates_users, 'users', 'user_id')
-
-        if employee_ids:
-            updates_employees = [{
-                "employee_id": random.choice(employee_ids),
-                "address": self.fake.address(),
-                "phone": self.fake.phone_number(),
-                "employment_status": random.choice(['active', 'inactive', 'resigned', 'on_leave', 'probation']),
-                "last_login": self.fake.date_time_between(current_date,
-                                                          current_date + timedelta(days=1)) + timedelta(
-                    days=random.randint(1, 10))
-            } for _ in range(employee_nums_update)]
-            self.update_mysql(updates_employees, 'employees', 'employee_id')
-
-        if product_ids:
-            updates_products = [{
-                "product_id": random.choice(product_ids),
-                "price": round(random.uniform(10, 10000), 2),
-                "cost_price": round(random.uniform(5, 1000), 2),
-                "discount_price": round(random.uniform(5, 500), 2),
-                "status": random.choice(['active', 'inactive', 'discontinued']),
-                "updated_at": self.fake.date_time_between(current_date,
-                                                          current_date + timedelta(days=1)) + timedelta(
-                    days=random.randint(1, 10))
-            } for _ in range(product_nums_update)]
-            self.update_mysql(updates_products, 'products', 'product_id')
-
-        print(f"修改数据完成，修改users：{user_nums_update}，修改employees：{employee_nums_update}，修改products：{product_nums_update}")
-
-    def simulate_data(self):
-        """逐日生成数据"""
+    def simulate_data(self) -> None:
+        """模拟生成数据的主函数"""
         current_date = self.start_time
+        total_days = (self.end_time - self.start_time).days
+        
+        try:
+            with tqdm(total=total_days, desc="Generating data") as pbar:
+                while current_date <= self.end_time:
+                    self.generate_daily_data(current_date)
+                    self._save_checkpoint(current_date)
+                    
+                    current_date += timedelta(days=1)
+                    pbar.update(1)
+                    time.sleep(self.frequency)
+                    
+            # 输出最终统计信息
+            self._print_stats()
+                    
+        except KeyboardInterrupt:
+            logging.info("\nData generation interrupted by user")
+            self._save_checkpoint(current_date)
+        except Exception as e:
+            logging.error(f"Error during data simulation: {e}")
+            self._save_checkpoint(current_date)
+        finally:
+            if hasattr(self, 'pool'):
+                self.pool.close()
 
-        while current_date <= self.end_time:
-            self.generate_daily_data(current_date)
-            current_date += timedelta(days=1)
-            time.sleep(self.frequency)  # 模拟每日生成的间隔
-# 使用时的示例
-db_config = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': '123456',
-    'database': 'yewu_erp',
-    'charset': 'utf8mb4'
-}
+    def _print_stats(self) -> None:
+        """打印统计信息"""
+        logging.info("\nData Generation Statistics:")
+        logging.info("\nGenerated Records:")
+        for table, count in self.stats['generated'].items():
+            logging.info(f"  {table}: {count:,}")
+            
+        logging.info("\nUpdated Records:")
+        for table, count in self.stats['updated'].items():
+            logging.info(f"  {table}: {count:,}")
+            
+        if self.stats['errors']:
+            logging.info("\nErrors encountered:")
+            for error in self.stats['errors'][:10]:  # 只显示前10个错误
+                logging.info(f"  - {error}")
+            if len(self.stats['errors']) > 10:
+                logging.info(f"  ... and {len(self.stats['errors']) - 10} more errors")
 
-simulator = DataSimulator(db_config, start_time=datetime(2024, 11, 1), end_time=datetime(2024, 11, 30), frequency=5)
-simulator.simulate_data()
+    def _init_db_pool(self) -> None:
+        """初始化数据库连接池"""
+        try:
+            self.pool = PooledDB(
+                creator=pymysql,
+                maxconnections=10,
+                mincached=2,
+                maxcached=5,
+                blocking=True,
+                maxshared=3,
+                setsession=[],
+                **self.db_config
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize database pool: {e}")
+
+    def _load_config_data(self) -> None:
+        """加载配置数据到内存"""
+        # 将原来的品牌、描述词等数据移到单独的配置文件或数据库中
+        self.brands = self._load_data_from_config('brands')
+        self.descriptors = self._load_data_from_config('descriptors')
+        self.categories = self._load_data_from_config('categories')
+        self.holiday_calendar = holidays.China()
+
+    @staticmethod
+    def _load_data_from_config(key: str) -> List[str]:
+        """
+        从配置文件加载数据
+        
+        Args:
+            key: 配置键名
+            
+        Returns:
+            配置数据列表
+        """
+        try:
+            return globals()[key.upper()]
+        except KeyError:
+            logging.warning(f"Configuration key {key} not found, using empty list")
+            return []
+
+    def _generate_updates(self, table: str, ids: List[int], count: int, current_date: datetime) -> List[Dict[str, Any]]:
+        """
+        生成数据更新
+        
+        Args:
+            table: 表名
+            ids: ID列表
+            count: 更新数量
+            current_date: 当前日期
+            
+        Returns:
+            更新数据列表
+        """
+        updates = []
+        selected_ids = random.sample(ids, min(count, len(ids)))
+        
+        for id_value in selected_ids:
+            if table == 'users':
+                update = {
+                    'user_id': id_value,
+                    'nickname': self.fake.first_name(),
+                    'email': self.fake.email(),
+                    'status': random.choice(["deleted", "active"]),
+                    'last_login': self.fake.date_time_between(
+                        current_date,
+                        current_date + timedelta(days=1)
+                    )
+                }
+            elif table == 'employees':
+                update = {
+                    'employee_id': id_value,
+                    'address': self.fake.address(),
+                    'phone': self.fake.phone_number(),
+                    'employment_status': random.choice(['active', 'inactive', 'resigned', 'on_leave', 'probation']),
+                    'last_login': self.fake.date_time_between(
+                        current_date,
+                        current_date + timedelta(days=1)
+                    )
+                }
+            elif table == 'products':
+                update = {
+                    'product_id': id_value,
+                    'price': round(random.uniform(10, 10000), 2),
+                    'cost_price': round(random.uniform(5, 1000), 2),
+                    'discount_price': round(random.uniform(5, 500), 2),
+                    'status': random.choice(['active', 'inactive', 'discontinued'])
+                }
+            
+            if self._validate_data(update, table.rstrip('s')):
+                updates.append(update)
+            
+        return updates
