@@ -362,7 +362,7 @@ class DataSimulator:
             raise DatabaseError(f"Database query failed: {e}")
         finally:
             if connection:
-                connection.close()
+            connection.close()
 
     def save_to_mysql(self, data: List[Dict[str, Any]], table_name: str) -> None:
         """
@@ -397,7 +397,7 @@ class DataSimulator:
             raise DatabaseError(f"Failed to save data to {table_name}: {e}")
         finally:
             if connection:
-                connection.close()
+            connection.close()
 
     def update_mysql(self, updates: List[Dict[str, Any]], table_name: str, primary_key: str):
         """Update data in a MySQL table."""
@@ -562,14 +562,14 @@ class DataSimulator:
         """模拟生成数据的主函数"""
         current_date = self.start_time
         total_days = (self.end_time - self.start_time).days
-        
+
         try:
             with tqdm(total=total_days, desc="Generating data") as pbar:
-                while current_date <= self.end_time:
-                    self.generate_daily_data(current_date)
+        while current_date <= self.end_time:
+            self.generate_daily_data(current_date)
                     self._save_checkpoint(current_date)
                     
-                    current_date += timedelta(days=1)
+            current_date += timedelta(days=1)
                     pbar.update(1)
                     time.sleep(self.frequency)
                     

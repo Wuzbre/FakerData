@@ -1,0 +1,101 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+    
+spring:
+  application:
+    name: sales-data-warehouse-api
+  
+  # 数据源配置
+  datasource:
+    # 主数据库 - MySQL
+    primary:
+      type: com.alibaba.druid.pool.DruidDataSource
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      url: jdbc:mysql://localhost:3306/sales_db?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+      username: root
+      password: password
+      druid:
+        initial-size: 5
+        min-idle: 5
+        max-active: 20
+        max-wait: 60000
+        time-between-eviction-runs-millis: 60000
+        min-evictable-idle-time-millis: 300000
+        validation-query: SELECT 1
+    
+    # 分析数据库 - Doris
+    doris:
+      type: com.alibaba.druid.pool.DruidDataSource
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      url: jdbc:mysql://localhost:9030/purchase_sales?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+      username: root
+      password: password
+      druid:
+        initial-size: 5
+        min-idle: 5
+        max-active: 20
+        max-wait: 60000
+  
+  # Jackson配置
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+    serialization:
+      write-dates-as-timestamps: false
+  
+  # 文件上传配置
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 100MB
+
+# MyBatis配置
+mybatis:
+  mapper-locations: classpath:mapper/**/*.xml
+  type-aliases-package: com.sales.api.model
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# 日志配置
+logging:
+  level:
+    root: info
+    com.sales.api: debug
+  file:
+    name: ./logs/sales-data-warehouse-api.log
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# 自定义配置
+sales:
+  # JWT配置
+  jwt:
+    secret-key: salesDataWarehouseSecretKey123456789
+    token-validity-in-seconds: 86400
+    token-validity-in-seconds-for-remember-me: 2592000
+  
+  # 跨域配置
+  cors:
+    allowed-origins: "*"
+    allowed-methods: "*"
+    allowed-headers: "*"
+    exposed-headers: "Authorization,Link,X-Total-Count"
+    allow-credentials: true
+    max-age: 1800
+  
+  # 缓存配置
+  cache:
+    timeToLiveSeconds: 3600
+  
+  # 数据分析配置
+  analysis:
+    # 默认获取最近多少天的数据
+    default-days: 30
+    # 支持的时间维度
+    time-dimensions: day,week,month,year
+    # 缓存刷新周期（分钟）
+    cache-refresh-interval: 60 

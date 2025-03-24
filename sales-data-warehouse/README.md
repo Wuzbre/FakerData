@@ -203,4 +203,4 @@ mvn clean package
 
 - 日志文件位于`log/`目录，包含详细的ETL执行记录和错误信息
 - ETL报告保存在`log/etl_report_yyyyMMdd.log`文件中，包含数据记录数和质量检查结果
-- 数据质量检查结果可在`purchase_sales_dq.dq_check_results`表中查询
+ 

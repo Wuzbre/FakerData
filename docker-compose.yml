@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  sales-data-warehouse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sales-data-warehouse
+    volumes:
+      # Mount configuration files
+      - ./src/main/resources:/app/src/main/resources
+      # Mount script directories
+      - ./hive:/app/hive
+      - ./doris:/app/doris
+      - ./scripts:/app/scripts
+      - ./datax:/app/datax
+      # Mount logs directory
+      - ./logs:/app/logs
+    environment:
+      # Java options
+      - JAVA_OPTS=-Xms1g -Xmx2g
+      # ETL date (default: yesterday)
+      - ETL_DATE=
+      # Specific ETL tasks to run (leave empty to run full pipeline)
+      - ETL_TASKS=
+      # Database connection parameters (can be overridden)
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=password
+      - HIVE_METASTORE_URI=thrift://hive-metastore:9083
+      - DORIS_HOST=doris-fe
+      - DORIS_PORT=9030
+    networks:
+      - etl-network
+    # Keep container running for debugging (in production, remove this)
+    # command: tail -f /dev/null
+
+networks:
+  etl-network:
+    driver: bridge 
