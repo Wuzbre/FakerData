@@ -1,0 +1,13 @@
+一：
+1.grep "14/Aug/2023" xxxx | wc -l
+2.grep "14/Aug/2023" xxxx | awk '{print $1}' | sort | uniq -c | sort -nr |head -n 10
+
+二：
+1.select a.Employeename,b.DepartmentName
+    from Employees a,Departments b
+where a.DepartmentID = b.DepartmentID;
+
+2.select a.departmaenName,b.Employeename from
+departments a left join employees b
+on a.departmentId = b.departmentid
+
