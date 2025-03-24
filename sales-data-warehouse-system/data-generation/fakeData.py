@@ -1,7 +1,24 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+购销数据仓库系统 - 数据生成模块
+生成模拟的用户、产品、订单、销售和库存数据，作为数据仓库的数据源
+"""
+
+import argparse
 import random
 import time
-from datetime import datetime, timedelta
+import datetime
+import os
+import sys
+from datetime import timedelta, datetime
+import mysql.connector
+from mysql.connector import Error
+import pandas as pd
+import numpy as np
 from faker import Faker
+from tqdm import tqdm
+from loguru import logger
 from dbutils.pooled_db import PooledDB
 import pymysql
 from typing import List, Dict, Any, Optional, Generator
@@ -10,18 +27,80 @@ import json
 import re
 import logging
 from pathlib import Path
-from tqdm import tqdm
+
+# 导入配置
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config.data_config import *
 
 # 设置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('data_generation.log'),
-        logging.StreamHandler()
-    ]
-)
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+logger.add("data_generation.log", rotation="10 MB", level="DEBUG")
+
+# 初始化Faker
+fake = Faker('zh_CN')
+Faker.seed(42)  # 设置随机种子，确保可重复性
+random.seed(42)
+np.random.seed(42)
+
+def connect_to_database():
+    """连接到MySQL数据库"""
+    try:
+        connection = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            port=DB_CONFIG['port']
+        )
+        
+        if connection.is_connected():
+            db_info = connection.get_server_info()
+            logger.info(f"已连接到MySQL服务器版本: {db_info}")
+            
+            # 创建数据库（如果不存在）
+            cursor = connection.cursor()
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {DB_CONFIG['database']}")
+            cursor.execute(f"USE {DB_CONFIG['database']}")
+            logger.info(f"使用数据库: {DB_CONFIG['database']}")
+            
+            # 创建表
+            for create_table_sql in CREATE_TABLES_SQL:
+                cursor.execute(create_table_sql)
+            connection.commit()
+            logger.info("数据库表结构已创建或已存在")
+            
+            return connection
+            
+    except Error as e:
+        logger.error(f"连接数据库时发生错误: {e}")
+        return None
+
+def clear_database(connection):
+    """清空数据库中的所有表"""
+    try:
+        cursor = connection.cursor()
+        
+        # 临时禁用外键约束
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+        
+        # 获取所有表名
+        cursor.execute(f"USE {DB_CONFIG['database']}")
+        cursor.execute("SHOW TABLES")
+        tables = [table[0] for table in cursor.fetchall()]
+        
+        # 清空所有表
+        for table in tables:
+            cursor.execute(f"TRUNCATE TABLE {table}")
+            logger.info(f"表 {table} 已清空")
+        
+        # 重新启用外键约束
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+        connection.commit()
+        logger.info("所有表已清空")
+    
+    except Error as e:
+        logger.error(f"清空数据库时发生错误: {e}")
+        connection.rollback()
 
 class DatabaseError(Exception):
     """数据库操作错误"""
@@ -338,7 +417,6 @@ class DataSimulator:
     def connect_to_db(self):
         return self.pool.connection()
 
-
     def query_from_db(self, query: str) -> List[Any]:
         """
         执行数据库查询。
@@ -362,7 +440,7 @@ class DataSimulator:
             raise DatabaseError(f"Database query failed: {e}")
         finally:
             if connection:
-            connection.close()
+                connection.close()
 
     def save_to_mysql(self, data: List[Dict[str, Any]], table_name: str) -> None:
         """
@@ -397,7 +475,7 @@ class DataSimulator:
             raise DatabaseError(f"Failed to save data to {table_name}: {e}")
         finally:
             if connection:
-            connection.close()
+                connection.close()
 
     def update_mysql(self, updates: List[Dict[str, Any]], table_name: str, primary_key: str):
         """Update data in a MySQL table."""
@@ -565,16 +643,16 @@ class DataSimulator:
 
         try:
             with tqdm(total=total_days, desc="Generating data") as pbar:
-        while current_date <= self.end_time:
-            self.generate_daily_data(current_date)
+                while current_date <= self.end_time:
+                    self.generate_daily_data(current_date)
                     self._save_checkpoint(current_date)
                     
-            current_date += timedelta(days=1)
+                    current_date += timedelta(days=1)
                     pbar.update(1)
                     time.sleep(self.frequency)
                     
-            # 输出最终统计信息
-            self._print_stats()
+                # 输出最终统计信息
+                self._print_stats()
                     
         except KeyboardInterrupt:
             logging.info("\nData generation interrupted by user")
@@ -697,3 +775,563 @@ class DataSimulator:
                 updates.append(update)
             
         return updates
+
+    def generate_orders(self, connection, num_orders):
+        """生成订单数据"""
+        logger.info(f"开始生成 {num_orders} 个订单数据...")
+        
+        # 获取用户ID列表
+        cursor = connection.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        user_ids = [row[0] for row in cursor.fetchall()]
+        
+        if not user_ids:
+            logger.error("没有找到用户数据，请先生成用户数据")
+            return []
+        
+        orders = []
+        order_items = []
+        
+        now = datetime.now()
+        order_date_min = now - timedelta(days=365)  # 生成过去一年的订单
+        
+        for i in tqdm(range(num_orders), desc="生成订单"):
+            # 随机选择用户
+            user_id = random.choice(user_ids)
+            
+            # 生成订单日期
+            order_date = fake.date_time_between(start_date=order_date_min, end_date=now)
+            
+            # 根据订单日期确定状态
+            if order_date > now - timedelta(days=1):
+                status = random.choice(['pending', 'paid', 'shipped'])
+            elif order_date > now - timedelta(days=7):
+                status = random.choice(['shipped', 'completed'])
+            else:
+                status = random.choice(['completed', 'returned'])
+            
+            # 生成配送信息
+            shipping_fee = round(random.uniform(0, 50), 2)
+            total_amount = round(random.uniform(100, 10000), 2)
+            discount = round(random.uniform(0, total_amount * 0.3), 2)
+            
+            # 生成订单
+            order = {
+                'user_id': user_id,
+                'order_date': order_date,
+                'status': status,
+                'payment_method': random.choice(list(PAYMENT_METHODS.keys())),
+                'shipping_fee': shipping_fee,
+                'total_amount': total_amount,
+                'discount': discount,
+                'shipping_address': fake.address(),
+                'shipping_city': fake.city(),
+                'shipping_province': fake.province(),
+                'shipping_postal_code': fake.postcode(),
+                'shipping_region': random.choice(list(REGIONS.keys())),
+                'delivery_date': order_date + timedelta(days=random.randint(1, 7)) if status in ['shipped', 'completed'] else None
+            }
+            orders.append(order)
+            
+            # 生成订单项
+            num_items = random.randint(1, 5)
+            for _ in range(num_items):
+                # 获取产品信息
+                cursor.execute("SELECT product_id, price FROM products WHERE is_active = TRUE ORDER BY RAND() LIMIT 1")
+                product = cursor.fetchone()
+                if not product:
+                    continue
+                    
+                product_id, price = product
+                quantity = random.randint(1, 5)
+                item_discount = round(random.uniform(0, price * 0.2), 2)
+                
+                order_item = {
+                    'order_id': None,  # 将在插入订单后更新
+                    'product_id': product_id,
+                    'quantity': quantity,
+                    'price': price,
+                    'discount': item_discount,
+                    'total_price': (price - item_discount) * quantity,
+                    'is_gift': random.choice([True, False])
+                }
+                order_items.append(order_item)
+        
+        # 批量插入订单
+        try:
+            cursor = connection.cursor()
+            
+            # 插入订单
+            order_sql = """
+            INSERT INTO orders (user_id, order_date, status, payment_method, shipping_fee,
+                               total_amount, discount, shipping_address, shipping_city,
+                               shipping_province, shipping_postal_code, shipping_region,
+                               delivery_date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            order_values = [(
+                order['user_id'], order['order_date'], order['status'],
+                order['payment_method'], order['shipping_fee'], order['total_amount'],
+                order['discount'], order['shipping_address'], order['shipping_city'],
+                order['shipping_province'], order['shipping_postal_code'],
+                order['shipping_region'], order['delivery_date']
+            ) for order in orders]
+            
+            cursor.executemany(order_sql, order_values)
+            connection.commit()
+            
+            # 获取新插入的订单ID
+            cursor.execute("SELECT LAST_INSERT_ID()")
+            last_id = cursor.fetchone()[0]
+            first_id = last_id - len(orders) + 1
+            
+            # 更新订单项的order_id
+            for i, order_item in enumerate(order_items):
+                order_item['order_id'] = first_id + (i // 5)  # 假设每个订单平均5个商品
+            
+            # 插入订单项
+            item_sql = """
+            INSERT INTO order_items (order_id, product_id, quantity, price, discount,
+                                    total_price, is_gift)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            item_values = [(
+                item['order_id'], item['product_id'], item['quantity'],
+                item['price'], item['discount'], item['total_price'],
+                item['is_gift']
+            ) for item in order_items]
+            
+            cursor.executemany(item_sql, item_values)
+            connection.commit()
+            
+            logger.info(f"成功插入 {len(orders)} 个订单和 {len(order_items)} 个订单项")
+            
+        except Error as e:
+            logger.error(f"插入订单数据时发生错误: {e}")
+            connection.rollback()
+        
+        return orders
+
+    def generate_inventory(self, connection):
+        """生成库存数据"""
+        logger.info("开始生成库存数据...")
+        
+        # 获取所有产品ID
+        cursor = connection.cursor()
+        cursor.execute("SELECT product_id FROM products WHERE is_active = TRUE")
+        product_ids = [row[0] for row in cursor.fetchall()]
+        
+        if not product_ids:
+            logger.error("没有找到产品数据，请先生成产品数据")
+            return []
+        
+        inventory_data = []
+        inventory_transactions = []
+        
+        now = datetime.now()
+        warehouse_locations = ['华东仓', '华北仓', '华南仓', '华中仓', '西南仓', '西北仓', '东北仓']
+        
+        for product_id in tqdm(product_ids, desc="生成库存"):
+            # 获取产品类别
+            cursor.execute(f"SELECT category FROM products WHERE product_id = {product_id}")
+            category = cursor.fetchone()[0]
+            
+            # 根据产品类别设置库存参数
+            turnover_rate = INVENTORY_TURNOVER_REFERENCE.get(category, 4.0)
+            low_stock_threshold = random.randint(10, 50)
+            reorder_quantity = random.randint(50, 200)
+            
+            # 生成初始库存
+            quantity = random.randint(100, 1000)
+            
+            # 生成库存记录
+            inventory = {
+                'product_id': product_id,
+                'quantity': quantity,
+                'low_stock_threshold': low_stock_threshold,
+                'reorder_quantity': reorder_quantity,
+                'last_restock_date': now - timedelta(days=random.randint(1, 30)),
+                'warehouse': random.choice(warehouse_locations)
+            }
+            inventory_data.append(inventory)
+            
+            # 生成库存交易记录
+            num_transactions = random.randint(5, 15)
+            transaction_date = now - timedelta(days=random.randint(1, 90))
+            
+            for _ in range(num_transactions):
+                transaction_type = random.choice(['入库', '出库', '调整'])
+                if transaction_type == '入库':
+                    transaction_quantity = random.randint(50, 200)
+                elif transaction_type == '出库':
+                    transaction_quantity = random.randint(10, 100)
+                else:  # 调整
+                    transaction_quantity = random.randint(-50, 50)
+                
+                transaction = {
+                    'product_id': product_id,
+                    'transaction_type': transaction_type,
+                    'quantity': transaction_quantity,
+                    'transaction_date': transaction_date,
+                    'order_id': None,  # 将在后续更新
+                    'notes': fake.sentence()
+                }
+                inventory_transactions.append(transaction)
+                
+                transaction_date += timedelta(days=random.randint(1, 7))
+        
+        # 批量插入库存数据
+        try:
+            cursor = connection.cursor()
+            
+            # 插入库存记录
+            inventory_sql = """
+            INSERT INTO inventory (product_id, quantity, low_stock_threshold,
+                                 reorder_quantity, last_restock_date, warehouse)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            
+            inventory_values = [(
+                inv['product_id'], inv['quantity'], inv['low_stock_threshold'],
+                inv['reorder_quantity'], inv['last_restock_date'], inv['warehouse']
+            ) for inv in inventory_data]
+            
+            cursor.executemany(inventory_sql, inventory_values)
+            connection.commit()
+            
+            # 插入库存交易记录
+            transaction_sql = """
+            INSERT INTO inventory_transactions (product_id, transaction_type,
+                                               quantity, transaction_date,
+                                               order_id, notes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """
+            
+            transaction_values = [(
+                trans['product_id'], trans['transaction_type'],
+                trans['quantity'], trans['transaction_date'],
+                trans['order_id'], trans['notes']
+            ) for trans in inventory_transactions]
+            
+            cursor.executemany(transaction_sql, transaction_values)
+            connection.commit()
+            
+            logger.info(f"成功插入 {len(inventory_data)} 个库存记录和 {len(inventory_transactions)} 个库存交易记录")
+            
+        except Error as e:
+            logger.error(f"插入库存数据时发生错误: {e}")
+            connection.rollback()
+        
+        return inventory_data
+
+def generate_users(connection, num_users):
+    """生成用户数据"""
+    logger.info(f"开始生成 {num_users} 个用户数据...")
+    
+    users = []
+    user_types = list(USER_TYPE_DISTRIBUTION.keys())
+    user_type_weights = list(USER_TYPE_DISTRIBUTION.values())
+    age_groups = list(USER_AGE_DISTRIBUTION.keys())
+    age_group_weights = list(USER_AGE_DISTRIBUTION.values())
+    
+    # 按区域权重生成用户分布
+    regions = list(REGION_DISTRIBUTION.keys())
+    region_weights = list(REGION_DISTRIBUTION.values())
+    user_regions = random.choices(regions, weights=region_weights, k=num_users)
+    
+    now = datetime.now()
+    registration_date_min = now - timedelta(days=365*2)  # 最早注册时间为2年前
+    
+    for i in tqdm(range(num_users), desc="生成用户"):
+        region = user_regions[i]
+        province = random.choice(REGIONS[region])
+        
+        # 随机确定用户类型和年龄组
+        user_type = random.choices(user_types, weights=user_type_weights, k=1)[0]
+        age_group = random.choices(age_groups, weights=age_group_weights, k=1)[0]
+        
+        # 随机生成注册时间
+        registration_date = fake.date_time_between(start_date=registration_date_min, end_date=now)
+        
+        # 随机生成最后登录时间，必须在注册时间之后
+        last_login = fake.date_time_between(start_date=registration_date, end_date=now)
+        
+        user = {
+            'username': fake.user_name(),
+            'password': fake.password(),
+            'email': fake.email(),
+            'phone': fake.phone_number(),
+            'address': fake.street_address(),
+            'city': fake.city(),
+            'province': province,
+            'postal_code': fake.postcode(),
+            'region': region,
+            'age_group': age_group,
+            'user_type': user_type,
+            'registration_date': registration_date,
+            'last_login': last_login
+        }
+        users.append(user)
+    
+    # 批量插入到数据库
+    try:
+        cursor = connection.cursor()
+        
+        sql = """
+        INSERT INTO users (username, password, email, phone, address, city, province, 
+                          postal_code, region, age_group, user_type, registration_date, last_login)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        values = [(user['username'], user['password'], user['email'], user['phone'], 
+                  user['address'], user['city'], user['province'], user['postal_code'], 
+                  user['region'], user['age_group'], user['user_type'], 
+                  user['registration_date'], user['last_login']) for user in users]
+        
+        cursor.executemany(sql, values)
+        connection.commit()
+        logger.info(f"成功插入 {len(users)} 个用户数据")
+        
+    except Error as e:
+        logger.error(f"插入用户数据时发生错误: {e}")
+        connection.rollback()
+    
+    return users
+
+def generate_suppliers(connection, num_suppliers=50):
+    """生成供应商数据"""
+    logger.info(f"开始生成 {num_suppliers} 个供应商数据...")
+    
+    suppliers = []
+    
+    # 按区域权重生成供应商分布
+    regions = list(REGION_DISTRIBUTION.keys())
+    region_weights = list(REGION_DISTRIBUTION.values())
+    supplier_regions = random.choices(regions, weights=region_weights, k=num_suppliers)
+    
+    now = datetime.now()
+    create_time_min = now - timedelta(days=365*3)  # 最早创建时间为3年前
+    
+    for i in tqdm(range(num_suppliers), desc="生成供应商"):
+        region = supplier_regions[i]
+        province = random.choice(REGIONS[region])
+        
+        # 随机生成创建时间
+        create_time = fake.date_time_between(start_date=create_time_min, end_date=now)
+        
+        supplier = {
+            'supplier_name': fake.company(),
+            'contact_name': fake.name(),
+            'email': fake.company_email(),
+            'phone': fake.phone_number(),
+            'address': fake.street_address(),
+            'city': fake.city(),
+            'province': province,
+            'postal_code': fake.postcode(),
+            'region': region,
+            'create_time': create_time
+        }
+        suppliers.append(supplier)
+    
+    # 批量插入到数据库
+    try:
+        cursor = connection.cursor()
+        
+        sql = """
+        INSERT INTO suppliers (supplier_name, contact_name, email, phone, address, city, 
+                              province, postal_code, region, create_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        values = [(supplier['supplier_name'], supplier['contact_name'], supplier['email'], 
+                  supplier['phone'], supplier['address'], supplier['city'], supplier['province'], 
+                  supplier['postal_code'], supplier['region'], supplier['create_time']) 
+                  for supplier in suppliers]
+        
+        cursor.executemany(sql, values)
+        connection.commit()
+        logger.info(f"成功插入 {len(suppliers)} 个供应商数据")
+        
+    except Error as e:
+        logger.error(f"插入供应商数据时发生错误: {e}")
+        connection.rollback()
+    
+    return suppliers
+
+def generate_products(connection, num_products):
+    """生成产品数据"""
+    logger.info(f"开始生成 {num_products} 个产品数据...")
+    
+    products = []
+    
+    # 获取供应商ID列表
+    cursor = connection.cursor()
+    cursor.execute("SELECT supplier_id FROM suppliers")
+    supplier_ids = [row[0] for row in cursor.fetchall()]
+    
+    if not supplier_ids:
+        logger.error("没有找到供应商数据，请先生成供应商数据")
+        return []
+    
+    # 按类别权重分配产品数量
+    categories = list(PRODUCT_CATEGORIES.keys())
+    category_weights = list(PRODUCT_CATEGORIES.values())
+    product_counts = [int(num_products * weight) for weight in category_weights]
+    
+    # 确保总数为num_products
+    diff = num_products - sum(product_counts)
+    product_counts[0] += diff
+    
+    now = datetime.now()
+    create_time_min = now - timedelta(days=365*2)  # 最早创建时间为2年前
+    
+    product_id = 1
+    
+    for i, category in enumerate(categories):
+        subcategory_dict = globals()[f"{category.upper().replace('产品', '')}_SUBCATEGORIES"]
+        subcategories = list(subcategory_dict.keys())
+        subcategory_weights = list(subcategory_dict.values())
+        
+        # 按子类别权重分配产品数量
+        subcategory_counts = [int(product_counts[i] * weight) for weight in subcategory_weights]
+        
+        # 确保总数为该类别的产品数量
+        diff = product_counts[i] - sum(subcategory_counts)
+        subcategory_counts[0] += diff
+        
+        for j, subcategory in enumerate(subcategories):
+            for _ in tqdm(range(subcategory_counts[j]), desc=f"生成{category}-{subcategory}产品"):
+                # 随机生成价格
+                min_price, max_price = PRICE_RANGES[category][subcategory]
+                price = round(random.uniform(min_price, max_price), 2)
+                
+                # 设置成本为价格的60-80%
+                cost = round(price * random.uniform(0.6, 0.8), 2)
+                
+                # 随机生成创建时间
+                create_time = fake.date_time_between(start_date=create_time_min, end_date=now)
+                
+                # 随机选择供应商
+                supplier = random.choice(supplier_ids)
+                
+                # 随机生成尺寸和重量
+                if category in ['电子产品', '家居']:
+                    weight = round(random.uniform(0.2, 15.0), 2)
+                    dimensions = f"{random.randint(10, 100)}x{random.randint(10, 100)}x{random.randint(5, 50)}"
+                elif category == '服装':
+                    weight = round(random.uniform(0.1, 2.0), 2)
+                    dimensions = random.choice(['S', 'M', 'L', 'XL', 'XXL'])
+                elif category == '食品':
+                    weight = round(random.uniform(0.05, 5.0), 2)
+                    dimensions = f"{random.randint(5, 30)}x{random.randint(5, 30)}x{random.randint(2, 20)}"
+                else:  # 图书
+                    weight = round(random.uniform(0.2, 3.0), 2)
+                    dimensions = f"{random.randint(15, 30)}x{random.randint(10, 25)}x{random.randint(1, 5)}"
+                
+                product = {
+                    'product_name': f"{subcategory} {fake.word()} {product_id}",
+                    'category': category,
+                    'subcategory': subcategory,
+                    'description': fake.paragraph(),
+                    'price': price,
+                    'cost': cost,
+                    'supplier': str(supplier),
+                    'sku': f"SKU-{category[:2]}-{subcategory[:2]}-{product_id:06d}",
+                    'weight': weight,
+                    'dimensions': dimensions,
+                    'is_active': random.choices([True, False], weights=[0.95, 0.05], k=1)[0],
+                    'create_time': create_time
+                }
+                products.append(product)
+                product_id += 1
+    
+    # 批量插入到数据库
+    try:
+        cursor = connection.cursor()
+        
+        sql = """
+        INSERT INTO products (product_name, category, subcategory, description, price, cost, 
+                             supplier, sku, weight, dimensions, is_active, create_time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        values = [(product['product_name'], product['category'], product['subcategory'], 
+                  product['description'], product['price'], product['cost'], product['supplier'], 
+                  product['sku'], product['weight'], product['dimensions'], 
+                  product['is_active'], product['create_time']) for product in products]
+        
+        cursor.executemany(sql, values)
+        connection.commit()
+        logger.info(f"成功插入 {len(products)} 个产品数据")
+        
+    except Error as e:
+        logger.error(f"插入产品数据时发生错误: {e}")
+        connection.rollback()
+    
+    return products
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(description='生成销售数据仓库的模拟数据')
+    parser.add_argument('--users', type=int, default=DEFAULT_USERS,
+                      help=f'要生成的用户数量 (默认: {DEFAULT_USERS})')
+    parser.add_argument('--products', type=int, default=DEFAULT_PRODUCTS,
+                      help=f'要生成的产品数量 (默认: {DEFAULT_PRODUCTS})')
+    parser.add_argument('--orders', type=int, default=DEFAULT_ORDERS,
+                      help=f'要生成的订单数量 (默认: {DEFAULT_ORDERS})')
+    parser.add_argument('--days', type=int, default=DEFAULT_DAYS,
+                      help=f'要生成的天数 (默认: {DEFAULT_DAYS})')
+    parser.add_argument('--clear', action='store_true',
+                      help='在生成新数据前清空数据库')
+    
+    args = parser.parse_args()
+    
+    # 连接数据库
+    connection = connect_to_database()
+    if not connection:
+        logger.error("无法连接到数据库")
+        return
+    
+    try:
+        # 如果需要，清空数据库
+        if args.clear:
+            logger.info("清空数据库...")
+            clear_database(connection)
+        
+        # 创建数据模拟器实例
+        simulator = DataSimulator(
+            db_config=DB_CONFIG,
+            start_time=datetime.now() - timedelta(days=args.days),
+            end_time=datetime.now()
+        )
+        
+        # 生成基础数据
+        logger.info("开始生成基础数据...")
+        users = generate_users(connection, args.users)
+        suppliers = generate_suppliers(connection)
+        products = generate_products(connection, args.products)
+        
+        # 生成订单和库存数据
+        logger.info("开始生成订单和库存数据...")
+        orders = simulator.generate_orders(connection, args.orders)
+        inventory = simulator.generate_inventory(connection)
+        
+        # 输出统计信息
+        logger.info("\n数据生成完成！统计信息：")
+        logger.info(f"用户数量: {len(users)}")
+        logger.info(f"供应商数量: {len(suppliers)}")
+        logger.info(f"产品数量: {len(products)}")
+        logger.info(f"订单数量: {len(orders)}")
+        logger.info(f"库存记录数量: {len(inventory)}")
+        
+    except Exception as e:
+        logger.error(f"数据生成过程中发生错误: {e}")
+        connection.rollback()
+    finally:
+        connection.close()
+        logger.info("数据库连接已关闭")
+
+if __name__ == "__main__":
+    main()
