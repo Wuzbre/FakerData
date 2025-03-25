@@ -27,10 +27,26 @@ import json
 import re
 import logging
 from pathlib import Path
+import yaml
+from chinese_calendar import is_holiday
+
+# 设置项目根目录
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
 
 # 导入配置
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from config.data_config import *
+from config.data_config import (
+    BRANDS, DESCRIPTORS, CATEGORIES, PRICE_RANGES,
+    USER_TYPE_DISTRIBUTION, USER_AGE_DISTRIBUTION,
+    REGION_DISTRIBUTION, REGIONS, PAYMENT_METHODS,
+    CREATE_TABLES_SQL, DIMENSION_TABLES,
+    DIMENSION_DATA_GENERATION, ACTIVITY_CONFIG,
+    ACTIVITY_DATES, ORDER_STATUS, ORDER_QUANTITY_RANGE,
+    SEASONAL_FACTORS, INVENTORY_TURNOVER_REFERENCE,
+    USER_PURCHASE_FREQUENCY
+)
+from config.db_config import DB_CONFIG
+from config.log_config import LOG_CONFIG
 
 # 设置日志
 logger.remove()
@@ -42,6 +58,53 @@ fake = Faker('zh_CN')
 Faker.seed(42)  # 设置随机种子，确保可重复性
 random.seed(42)
 np.random.seed(42)
+
+class Config:
+    """配置管理类"""
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.config = self._load_config()
+        self._validate_config()
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """加载配置文件"""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
+            raise
+    
+    def _validate_config(self):
+        """验证配置有效性"""
+        required_sections = ['database', 'generation', 'performance', 'logging']
+        for section in required_sections:
+            if section not in self.config:
+                raise ValueError(f"配置文件缺少必要的 {section} 部分")
+        
+        # 验证数据库配置
+        db_config = self.config['database']
+        required_db_fields = ['host', 'port', 'user', 'password', 'database']
+        for field in required_db_fields:
+            if field not in db_config:
+                raise ValueError(f"数据库配置缺少必要的 {field} 字段")
+        
+        # 验证生成配置
+        gen_config = self.config['generation']
+        required_gen_fields = ['base_metrics', 'update_ratios', 'price_changes']
+        for field in required_gen_fields:
+            if field not in gen_config:
+                raise ValueError(f"生成配置缺少必要的 {field} 字段")
+    
+    def get(self, *keys: str, default: Any = None) -> Any:
+        """获取配置值"""
+        value = self.config
+        for key in keys:
+            if isinstance(value, dict):
+                value = value.get(key, default)
+            else:
+                return default
+        return value
 
 def connect_to_database():
     """连接到MySQL数据库"""
@@ -116,915 +179,259 @@ class DataSimulator:
     支持生成用户、员工、产品、订单等相关数据。
 
     Attributes:
-        db_config (dict): 数据库配置信息
+        config (Config): 配置对象
         start_time (datetime): 数据生成的开始时间
         end_time (datetime): 数据生成的结束时间
-        frequency (int): 数据生成的频率(秒)
+        scale_factor (float): 数据量缩放因子
     """
     
-    def __init__(self, db_config: Dict[str, Any], start_time: Optional[datetime] = None,
-                 end_time: Optional[datetime] = None, frequency: int = 1):
+    def __init__(self, config: Config, start_time: datetime,
+                 end_time: datetime, scale_factor: float = 0.01):
         """
-        初始化数据模拟器。
+        初始化数据模拟器
         
         Args:
-            db_config: 数据库配置
+            config: 配置对象
             start_time: 开始时间
             end_time: 结束时间
-            frequency: 生成频率
+            scale_factor: 数据量缩放因子
         """
-        self.db_config = db_config
-        self.fake = Faker('zh_CN')
-        self.fake_en = Faker('en_US')  # 重命名为更清晰的名称
-        self.start_time = start_time or datetime.now()
-        self.end_time = end_time or (self.start_time + timedelta(days=30))
-        self.frequency = frequency
+        self.config = config
+        self.start_time = start_time
+        self.end_time = end_time
+        self.scale_factor = scale_factor
         
         # 初始化数据库连接池
         self._init_db_pool()
         
-        # 加载配置和断点信息
-        self._load_config_data()
-        self._load_checkpoint()
+        # 设置每日数据量基准
+        self.daily_metrics = {
+            k: int(v * scale_factor)
+            for k, v in self.config.get('generation', 'base_metrics').items()
+        }
         
         # 初始化统计信息
         self.stats = {
-            'generated': {k: 0 for k in DATA_GENERATION['base_rates'].keys()},
-            'updated': {k: 0 for k in DATA_GENERATION['base_rates'].keys()},
+            'generated': {k: 0 for k in self.daily_metrics.keys()},
+            'updated': {k: 0 for k in self.daily_metrics.keys()},
             'errors': []
         }
 
-        self.brands = [
-            "华为", "小米", "苹果", "三星", "荣耀", "OPPO", "vivo",  # 电子品牌
-            "耐克", "阿迪达斯", "彪马", "安踏", "李宁", "New Balance",  # 运动品牌
-            "古驰", "路易威登", "香奈儿", "爱马仕", "迪奥", "普拉达",  # 奢侈品牌
-            "ZARA", "H&M", "优衣库", "Gap", "Forever 21", "Levi's",  # 服装品牌
-            "宜家", "苏宁", "京东", "天猫", "沃尔玛", "Target",  # 零售品牌
-            "大众", "丰田", "宝马", "奔驰", "特斯拉", "奥迪",  # 汽车品牌
-            "瑞士军刀", "凯迪拉克", "雪佛兰", "麦当劳",  # 一些混合品牌
-        ]
-
-        self.descriptors = [
-            "Pro", "X", "Max", "Air", "Ultra", "Lite",  # 高端技术词汇
-            "时尚", "经典", "奢华", "舒适", "流行", "运动", "高性能",  # 服饰、鞋类
-            "智能", "迷你", "轻盈", "超薄", "高效", "坚固", "全新",  # 电子产品
-            "环保", "健康", "高端", "艺术", "豪华", "限量版", "复古",  # 家居、配件
-            "商务", "创新", "完美", "豪华", "优雅", "极致",  # 生活类商品
-            "经典", "高街", "街头", "前卫", "运动风", "工装",  # 服装鞋类
-            "透明", "可穿戴", "便捷", "耐用", "节能", "奢侈",  # 日常用品
-            "全包围", "舒适性", "快速充电", "静音", "高清",  # 家电类
-        ]
-
-        self.categories = [
-            "智能手机", "笔记本电脑", "无线耳机", "智能手表", "智能音响", "4K电视",  # 电子产品
-            "运动鞋", "跑步鞋", "篮球鞋", "休闲鞋", "帆布鞋", "拖鞋",  # 鞋类
-            "外套", "T恤", "衬衫", "牛仔裤", "裙子", "连衣裙", "羽绒服",  # 服装
-            "运动服", "瑜伽裤", "运动内衣", "运动背心", "卫衣",  # 运动装备
-            "背包", "手袋", "钱包", "皮带", "太阳镜", "帽子",  # 配饰
-            "沙发", "床垫", "书桌", "餐桌", "椅子", "书架",  # 家居
-            "茶具", "咖啡机", "厨房电器", "冰箱", "洗衣机", "微波炉",  # 家电
-            "化妆品", "护肤品", "香水", "面膜", "口红", "睫毛膏",  # 美妆
-            "保健品", "营养补充剂", "减肥药", "维生素", "蛋白粉",  # 健康产品
-            "游戏机", "手柄", "桌游", "拼图", "积木", "电子书",  # 玩具、游戏
-            "零食", "饮料", "巧克力", "糖果", "果汁", "即食食品",  # 食品
-            "汽车", "电动滑板车", "摩托车", "自行车",  # 交通工具
-        ]
-        self.holiday_calendar = holidays.China()
-
-    def is_holiday(self, date):
-        """判断是否为节假日"""
-        return date in self.holiday_calendar
-
-    def generate_user_data(self, current_date):
-        created_at = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        # strftime("%Y-%m-%d")
-        email = self.fake.email()
-        return {
-            "user_id": None,  # 用户唯一标识
-            "username": self.fake.user_name(),  # 用户名
-            "email": email,  # 用户邮箱
-            "phone": self.fake.phone_number(),  # 用户手机号
-            "password": self.fake.password(),  # 密码
-            "nickname": self.fake.first_name(),  # 用户昵称
-            "avatar_url": self.fake.image_url(),  # 用户头像URL
-            # "status": random.choice(['active', 'deleted']),  # 账户状态
-            "is_verified": random.choice([True, False]),  # 邮箱/手机号是否验证
-            "role": self.fake.job(),  # 用户角色
-            "created_at": created_at,  # 账户创建时间
-            "updated_at": None,  # 最后更新时间
-            "last_login": None,  # 最后登录时间
-            "account_balance": None,  # 账户余额
-            "points_balance": None,  # 积分余额
-            "membership_level": None,  # 会员等级
-            "failed_attempts": None,  # 登录失败次数
-            "lock_until": None,  # 锁定时间
-            "two_factor_enabled": random.choice([True, False]),  # 是否启用双因素认证
-            "preferred_language": self.fake.language_name(),  # 用户语言偏好
-            "preferred_currency": random.choice(['CNY', 'USD', 'EUR']),  # 用户货币偏好
-            "shipping_address": self.fake.address(),  # 收货地址
-            "billing_address": email,  # 账单地址
-            "newsletter_subscribed": random.choice([True, False]),  # 是否订阅邮件
-            "referral_code": self.fake.bothify(text='??-####'),  # 推荐码
-            "referred_by_user_id": None,  # 推荐用户ID
-            "cart_id": None,  # 购物车ID
-            "order_count": None,  # 订单数量
-            "order_total": None  # 累计消费总额
-        }
-
-    def generate_employee_data(self, current_date):
-        created_at = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        hire_date = created_at.strftime("%Y-%m-%d")
-        probation_period_end = (created_at + timedelta(days=90)).strftime("%Y-%m-%d")
-        return {
-            "employee_id": None,  # 员工唯一标识
-            "first_name": self.fake.first_name(),  # 员工名字
-            "last_name": self.fake.last_name(),  # 员工姓氏
-            "gender": random.choice(['male', 'female', 'other']),  # 性别
-            "birth_date": self.fake.date_of_birth(minimum_age=15, maximum_age=70),  # 出生日期
-            "email": self.fake.company_email(),  # 邮箱地址
-            "phone": self.fake.phone_number(),  # 手机号
-            "address": self.fake.address(),  # 员工住址
-            "emergency_contact": self.fake.name(),  # 紧急联系人
-            "hire_date": hire_date,  # 入职日期
-            "position": self.fake.job(),  # 职位
-            "department": self.fake.bs(),  # 部门
-            # "employment_status": None,
-            # random.choice(['active', 'inactive', 'resigned', 'on_leave', 'probation']),雇佣状态
-            "work_status": random.choice(['full_time', 'part_time', 'intern']),  # 工作状态
-            "probation_period_end": probation_period_end,  # 试用期结束日期
-            "termination_date": None,  # 离职日期
-            "resignation_reason": None,  # 离职原因
-            "created_at": created_at,  # 创建时间
-            "updated_at": None,  # 最后更新时间
-            "last_login": None,  # 最后登录时间
-        }
-
-    def generate_product_data(self, current_date):
-        brand = random.choice(self.brands)
-        descriptor = random.choice(self.descriptors)
-        category = random.choice(self.categories)
-        product_name = f"{brand} {category} {descriptor}"
-        price = round(random.uniform(10, 10000), 2)
-        cost_price = round(random.uniform(5, price), 2)
-        discount_price = round(price - cost_price, 2)
-        create_at = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        launch_date = (create_at + timedelta(days=7)).strftime("%Y-%m-%d")
-        return {
-            "product_id": None,  # 产品唯一标识
-            "product_name": product_name,  # 产品名称
-            "product_description": self.fake.text(),  # 产品描述
-            "sku": self.fake.bothify(text="???-#####"),  # 产品SKU
-            "category_id": random.randint(1, 20),  # 产品分类ID，关联到分类表
-            "brand": brand,  # 品牌名称
-            "model": self.fake.bothify(text="Model-###"),  # 产品型号或系列
-            "color": self.fake.color_name(),  # 产品颜色
-            "price": price,  # 销售价格
-            "cost_price": cost_price,  # 成本价格
-            "discount_price": discount_price,  # 折扣价格
-            "currency": random.choice(['CNY', 'USD', 'EUR']),  # 货币类型
-            # "status": random.choice(['active', 'inactive', 'discontinued']),  # 产品状态
-            "launch_date": launch_date,  # 上架日期
-            "discontinued_date": None,  # 停产日期
-            "supplier_id": random.randint(1, 100),  # 供应商ID
-            "manufacturer": self.fake.company(),  # 制造商名称
-            "country_of_origin": self.fake.country(),  # 生产国家
-            "image_url": self.fake.image_url(),  # 主图URL
-            "additional_images": ','.join([self.fake.image_url() for _ in range(3)]),  # 其他图片URL（多个以逗号分隔）
-            "weight": round(random.uniform(0.5, 10), 2),  # 产品重量
-            "dimensions": f"{random.randint(10, 50)}x{random.randint(10, 50)}x{random.randint(1, 20)}",  # 产品尺寸
-            "warranty": self.fake.sentence(),  # 保修期
-            "created_at": create_at,  # 创建时间
-            "updated_at": None  # 最后更新时间
-        }
-
-    def generate_purchase_order_data(self, current_date):
-        # print(self.query_from_db("SELECT employee_id FROM employees"))
-        created_by = random.choices(self.query_from_db("SELECT employee_id FROM employees"))
-        approved_by = random.choices(self.query_from_db("SELECT employee_id FROM employees"))
-        order_date = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        expected_delivery_date = order_date + timedelta(days=self.fake.random_int(10, 100))
-        # actual_delivery_date = expected_delivery_date - timedelta(days=self.fake.random_int(-10, 80))
-        payment_date = order_date + timedelta(days=self.fake.random_int(10, 20))
-        return {
-            "purchase_order_id": None,  # 采购订单唯一标识
-            "supplier_id": random.randint(1, 100),  # 供应商ID，关联供应商表
-            "order_date": order_date,  # 下单日期
-            "expected_delivery_date": expected_delivery_date,  # 预计交货日期
-            "actual_delivery_date": None,  # 实际交货日期
-            "status": random.choice(['pending', 'approved', 'shipped', 'received', 'completed', 'canceled']),  # 订单状态
-            "total_amount": round(random.uniform(500, 50000), 2),  # 订单总金额
-            "currency": random.choice(['CNY', 'USD', 'EUR']),  # 货币类型
-            "payment_status": random.choice(['unpaid', 'paid', 'partial', 'overdue']),  # 支付状态
-            "payment_method": self.fake.credit_card_provider(),  # 支付方式
-            "payment_date": payment_date,  # 支付日期
-            "shipping_cost": round(random.uniform(0, 100), 2),  # 配送费用
-            "warehouse_location": self.fake.address(),  # 存放仓库位置
-            "created_by": created_by,  # 创建者ID
-            "approved_by": approved_by,  # 审批人ID
-            "note": self.fake.text(),  # 备注
-            "created_at": order_date,  # 创建时间
-            "updated_at": None  # 最后更新时间
-        }
-
-    def generate_purchase_order_item_data(self, current_date):
-        quantity = random.randint(1, 50)  # 随机选择数量
-        unit_price = round(random.uniform(10, 500), 2)  # 随机生成单价
-        total_price = quantity * unit_price  # 计算总价
-        received_quantity = 0  # 初始时，已接收数量为0
-        status = random.choice(['pending', 'received', 'canceled'])  # 随机选择项目状态
-        create = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        expected_delivery_date = (create + timedelta(days=self.fake.random_int(10, 100))).strftime("%Y-%m-%d")  # 预计交货日期
-        actual_delivery_date = None  # 实际交货日期，默认值为None
-
-        purchase_order_id = random.choices(
-            self.query_from_db("SELECT purchase_order_id FROM purchase_orders"))
-        product_id = random.choices(self.query_from_db("SELECT product_id FROM products"))
-        return {
-            "purchase_order_item_id": None,  # 采购订单项ID由数据库自动生成
-            "purchase_order_id": purchase_order_id,  # 关联到采购订单表的ID
-            "product_id": product_id,  # 产品ID，关联到产品表
-            "quantity": quantity,  # 数量
-            "unit_price": unit_price,  # 单价
-            "total_price": total_price,  # 总价（计算列）
-            "received_quantity": received_quantity,  # 已接收数量(废弃)
-            "status": status,  # 项目状态
-            "expected_delivery_date": expected_delivery_date,  # 项目预计交货日期
-            "actual_delivery_date": actual_delivery_date  # 项目实际交货日期
-        }
-
-    def generate_sales_order_data(self, current_date):
-        user_id = random.choices(self.query_from_db("SELECT user_id FROM users"))
-        created_by = random.choices(self.query_from_db("SELECT employee_id FROM employees"))
-        order_date = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
-        expected_delivery_date = order_date + timedelta(days=self.fake.random_int(10, 100))
-        total_amount = round(random.uniform(100, 10000), 2)
-        discount = round(total_amount - round(random.uniform(0, total_amount), 2), 2)
-        final_amount = round(total_amount - discount, 2)
-        return {
-            "sales_order_id": None,  # 销售订单唯一标识
-            "user_id": user_id,  # 客户ID，关联到用户表
-            "order_date": order_date,  # 下单日期
-            "expected_delivery_date": expected_delivery_date,  # 预计交货日期
-            "actual_delivery_date": None,  # 实际交货日期
-            "shipping_method": self.fake.word(),  # 配送方式
-            "shipping_cost": round(random.uniform(0, 100), 2),  # 配送费用
-            "shipping_address": self.fake.address(),  # 收货地址
-            "billing_address": self.fake.address(),  # 账单地址
-            "status": random.choice(['pending', 'paid', 'shipped', 'completed', 'returned', 'canceled']),  # 订单状态
-            "total_amount": total_amount,  # 订单总金额
-            "currency": random.choice(['CNY', 'USD', 'EUR']),  # 货币类型
-            "discount": discount,  # 订单总折扣
-            "final_amount": final_amount,  # 最终应支付金额
-            "payment_status": random.choice(['unpaid', 'paid', 'refunded']),  # 支付状态
-            "payment_method": self.fake.credit_card_provider(),  # 支付方式
-            "payment_date": order_date,  # 支付日期
-            "tracking_number": self.fake.bothify(text="??-#######"),  # 快递单号
-            "created_by": created_by,  # 创建者ID
-            "note": self.fake.text(),  # 备注
-            "referral_code": self.fake.bothify(text='??-####'),  # 推荐码
-            "created_at": order_date,  # 创建时间
-            "updated_at": None  # 最后更新时间
-        }
-
-    def generate_sales_order_item_data(self, current_date):
-        quantity = random.randint(1, 5)
-        unit_price = round(random.uniform(20, 500), 2)
-        total_price = quantity * unit_price
-        discount = round(random.uniform(0, 50), 2)
-        final_price = round(total_price - discount, 2)
-        expected_delivery_date = self.fake.date_time_between(current_date,
-                                                             current_date + timedelta(days=1)) + timedelta(
-            days=random.randint(1, 10))
-        sales_order_id = random.choices(
-            self.query_from_db("SELECT sales_order_id FROM sales_orders"))
-        product_id = random.choices(self.query_from_db("SELECT product_id FROM products"))
-
-        return {
-            "sales_order_item_id": None,  # 销售订单项ID在数据库自动生成
-            "sales_order_id": sales_order_id,  # 关联到销售订单表的ID
-            "product_id": product_id,  # 产品ID，关联到产品表
-            "quantity": quantity,  # 数量
-            "unit_price": unit_price,  # 单价
-            "total_price": total_price,  # 总价（计算列）
-            "discount": discount,  # 项目折扣金额
-            "final_price": final_price,  # 最终价格（计算列）
-            "expected_delivery_date": expected_delivery_date,  # 项目预计交货日期
-            "actual_delivery_date": None,  # 项目实际交货日期
-            "status": random.choice(['pending', 'shipped', 'delivered', 'returned']),  # 项目状态
-            "warehouse_location": self.fake.city(),  # 发货仓库位置
-        }
-
-    def connect_to_db(self):
-        return self.pool.connection()
-
-    def query_from_db(self, query: str) -> List[Any]:
-        """
-        执行数据库查询。
+        # 初始化Faker
+        self.fake = Faker(['zh_CN'])
         
-        Args:
-            query: SQL查询语句
-            
-        Returns:
-            查询结果列表
-            
-        Raises:
-            DatabaseError: 数据库查询失败时抛出
-        """
-        connection = None
+        # 设置随机种子
+        random.seed(int(time.time()))
+
+    def _init_db_pool(self):
+        """初始化数据库连接池"""
         try:
-            connection = self.pool.connection()
-            with connection.cursor(cursor=pymysql.cursors.Cursor) as cursor:
-                cursor.execute(query)
-                return [row[0] for row in cursor.fetchall()]
-        except pymysql.Error as e:
-            raise DatabaseError(f"Database query failed: {e}")
-        finally:
-            if connection:
-                connection.close()
+            db_config = self.config.get('database')
+            pool_config = {
+                'pool_name': 'mypool',
+                'pool_size': db_config.get('pool_size', 5),
+                'host': db_config.get('host'),
+                'port': db_config.get('port'),
+                'user': db_config.get('user'),
+                'password': db_config.get('password'),
+                'database': db_config.get('database'),
+                'charset': db_config.get('charset', 'utf8mb4')
+            }
+            self.pool = pooling.MySQLConnectionPool(**pool_config)
+            logger.info("数据库连接池初始化成功")
+        except Error as e:
+            logger.error(f"初始化数据库连接池失败: {e}")
+            raise
 
-    def save_to_mysql(self, data: List[Dict[str, Any]], table_name: str) -> None:
-        """
-        批量保存数据到MySQL。
-        
-        Args:
-            data: 要保存的数据列表
-            table_name: 表名
-            
-        Raises:
-            DatabaseError: 数据保存失败时抛出
-        """
+    def _get_connection(self) -> Optional[pooling.MySQLConnection]:
+        """获取数据库连接"""
+        try:
+            return self.pool.get_connection()
+        except Error as e:
+            logger.error(f"获取数据库连接失败: {e}")
+            return None
+
+    def _batch_insert(self, connection, table: str, data: List[Dict[str, Any]]):
+        """批量插入数据"""
         if not data:
             return
             
-        connection = None
-        try:
-            connection = self.pool.connection()
-            with connection.cursor() as cursor:
-                keys = data[0].keys()
-                columns = ', '.join(keys)
-                placeholders = ', '.join(['%s'] * len(keys))
-                values = [tuple(record[key] for key in keys) for record in data]
-                
-                query = f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})"
-                cursor.executemany(query, values)
-                
-            connection.commit()
-        except pymysql.Error as e:
-            if connection:
-                connection.rollback()
-            raise DatabaseError(f"Failed to save data to {table_name}: {e}")
-        finally:
-            if connection:
-                connection.close()
-
-    def update_mysql(self, updates: List[Dict[str, Any]], table_name: str, primary_key: str):
-        """Update data in a MySQL table."""
-        if not updates:
-            return
-        connection = self.connect_to_db()
-        try:
-            with connection.cursor() as cursor:
-                for update in updates:
-                    set_clause = ', '.join([f"{key} = %s" for key in update.keys() if key != primary_key])
-                    query = f"UPDATE {table_name} SET {set_clause}, updated_at = %s WHERE {primary_key} = %s"
-                    values = tuple(update[key] for key in update.keys() if key != primary_key)
-                    values += (datetime.now(), update[primary_key])
-                    cursor.execute(query, values)
-            connection.commit()
-        except pymysql.MySQLError as e:
-            print(f"Error while updating {table_name}: {e}")
-        finally:
-            connection.close()
-
-    def generate_daily_data(self, current_date: datetime) -> None:
-        """
-        生成每日数据。
+        cursor = connection.cursor()
+        columns = data[0].keys()
+        placeholders = ', '.join(['%s'] * len(columns))
+        query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
         
-        Args:
-            current_date: 当前日期
-        """
-        try:
-            # 计算增长数量
-            growth_rates = self._calculate_growth_rates(current_date)
-            
-            # 生成基础数据
-            data_generators = {
-                'users': (self.generate_user_data, growth_rates['user']),
-                'employees': (self.generate_employee_data, growth_rates['employee']),
-                'products': (self.generate_product_data, growth_rates['product']),
-                'purchase_orders': (self.generate_purchase_order_data, growth_rates['purchase_order']),
-                'sales_orders': (self.generate_sales_order_data, growth_rates['sales_order'])
-            }
-            
-            # 批量生成并保存数据
-            for table_name, (generator, count) in data_generators.items():
-                data = [generator(current_date) for _ in range(count)]
-                self.save_to_mysql(data, table_name)
-                
-            # 生成关联数据
-            self._generate_related_data(current_date, growth_rates)
-            
-            # 更新现有数据
-            self._update_existing_data(current_date)
-            
-            print(f"Successfully generated data for {current_date.strftime('%Y-%m-%d')}")
-            
-        except Exception as e:
-            print(f"Error generating data for {current_date}: {e}")
-            # 可以添加重试逻辑或告警机制
+        # 分批插入数据
+        batch_size = self.config.get('performance', 'batch_size', default=1000)
+        for i in range(0, len(data), batch_size):
+            batch = data[i:i + batch_size]
+            values = [tuple(record[col] for col in columns) for record in batch]
+            try:
+                cursor.executemany(query, values)
+                connection.commit()
+            except Error as e:
+                connection.rollback()
+                logger.error(f"批量插入数据失败: {e}")
+                raise
 
-    def _calculate_growth_rates(self, current_date: datetime) -> Dict[str, int]:
-        """计算各类数据的增长率"""
-        is_holiday = self.is_holiday(current_date)
-        base_rates = {
-            'user': 500,
-            'employee': 1,
-            'product': 40,
-            'purchase_order': 300,
-            'sales_order': 600
-        }
+    def _update_products(self, connection, current_date):
+        """更新商品信息"""
+        try:
+            cursor = connection.cursor()
+            
+            # 获取要更新的商品
+            update_ratio = self.config.get('generation', 'update_ratios', 'products', default=0.15)
+            cursor.execute("""
+                SELECT product_id, price, category, subcategory 
+                FROM products 
+                WHERE is_active = TRUE 
+                ORDER BY RAND() 
+                LIMIT %s
+            """, (int(self.daily_metrics['products'] * update_ratio),))
+            
+            products_to_update = cursor.fetchall()
+            
+            for product_id, current_price, category, subcategory in products_to_update:
+                # 生成更新时间和更新内容
+                update_time = self.fake.date_time_between(current_date, current_date + timedelta(days=1))
+                
+                # 根据商品类别调整价格范围
+                price_changes = self.config.get('generation', 'price_changes')
+                if category == '电子产品':
+                    price_change = random.uniform(-price_changes['electronics'], price_changes['electronics'])
+                elif category == '服装':
+                    price_change = random.uniform(-price_changes['clothing'], price_changes['clothing'])
+                else:
+                    price_change = random.uniform(-price_changes['others'], price_changes['others'])
+                
+                new_price = round(current_price * (1 + price_change), 2)
+                
+                # 更新商品信息
+                update_sql = """
+                UPDATE products 
+                SET price = %s, 
+                    description = %s,
+                    weight = %s,
+                    dimensions = %s,
+                    updated_at = %s
+                WHERE product_id = %s
+                """
+                
+                # 根据商品类别生成新的重量和尺寸
+                if category == '电子产品':
+                    weight = round(random.uniform(0.2, 15.0), 2)
+                    dimensions = f"{random.randint(10, 100)}x{random.randint(10, 100)}x{random.randint(5, 50)}"
+                elif category == '服装':
+                    weight = round(random.uniform(0.1, 2.0), 2)
+                    dimensions = random.choice(['S', 'M', 'L', 'XL', 'XXL'])
+                else:
+                    weight = round(random.uniform(0.05, 5.0), 2)
+                    dimensions = f"{random.randint(5, 30)}x{random.randint(5, 30)}x{random.randint(2, 20)}"
+                
+                cursor.execute(update_sql, (
+                    new_price,
+                    self.fake.paragraph(),
+                    weight,
+                    dimensions,
+                    update_time,
+                    product_id
+                ))
+            
+            connection.commit()
+            logger.info(f"成功更新 {len(products_to_update)} 个商品信息")
+            
+        except Error as e:
+            logger.error(f"更新商品信息时发生错误: {e}")
+            connection.rollback()
+
+    def _adjust_data_volume(self, connection, current_date):
+        """根据节假日和季节调整数据量"""
+        # 获取当前日期是否为节假日
+        is_holiday = is_holiday(current_date.date())
+        
+        # 获取当前季节
+        month = current_date.month
+        season = (month - 1) // 3 + 1
+        
+        # 调整因子
+        holiday_factor = 1.0
+        season_factor = 1.0
+        day_of_week_factor = 1.0
         
         # 节假日调整
+        holiday_factors = self.config.get('generation', 'holiday_factors')
         if is_holiday:
-            return {k: v // 2 for k, v in base_rates.items()}
-        return base_rates
-
-    def _load_checkpoint(self) -> None:
-        """加载断点信息"""
-        checkpoint_file = Path('checkpoint.json')
-        if checkpoint_file.exists():
-            with open(checkpoint_file, 'r') as f:
-                checkpoint = json.load(f)
-                self.start_time = datetime.fromisoformat(checkpoint['last_date'])
-                logging.info(f"Resuming from checkpoint: {self.start_time}")
-
-    def _save_checkpoint(self, current_date: datetime) -> None:
-        """保存断点信息"""
-        with open('checkpoint.json', 'w') as f:
-            json.dump({
-                'last_date': current_date.isoformat(),
-                'stats': self.stats
-            }, f)
-
-    def _validate_data(self, data: Dict[str, Any], data_type: str) -> bool:
-        """
-        验证数据是否符合规则
+            holiday_factor = holiday_factors['holiday']
+        elif is_holiday(current_date.date() + timedelta(days=1)):
+            holiday_factor = holiday_factors['before']
+        elif is_holiday(current_date.date() - timedelta(days=1)):
+            holiday_factor = holiday_factors['after']
         
-        Args:
-            data: 要验证的数据
-            data_type: 数据类型（user/product等）
-            
-        Returns:
-            bool: 验证是否通过
-            
-        Raises:
-            DataValidationError: 数据验证失败时抛出
-        """
-        rules = VALIDATION_RULES.get(data_type, {})
+        # 特殊节日调整
+        special_dates = holiday_factors.get('special', {})
+        date_key = f"{month:02d}-{current_date.day:02d}"
+        if date_key in special_dates:
+            holiday_factor = special_dates[date_key]
         
-        try:
-            if data_type == 'user':
-                if not re.match(rules['email'], data['email']):
-                    raise DataValidationError(f"Invalid email: {data['email']}")
-                if not re.match(rules['phone'], data['phone']):
-                    raise DataValidationError(f"Invalid phone: {data['phone']}")
-                if len(data['password']) < rules['password_min_length']:
-                    raise DataValidationError("Password too short")
-                    
-            elif data_type == 'product':
-                if not rules['price_min'] <= data['price'] <= rules['price_max']:
-                    raise DataValidationError(f"Price out of range: {data['price']}")
-                    
-            return True
-            
-        except DataValidationError as e:
-            self.stats['errors'].append(str(e))
-            logging.warning(f"Data validation failed: {e}")
-            return False
+        # 工作日调整
+        weekday_factors = self.config.get('generation', 'weekday_factors')
+        if current_date.weekday() >= 5:  # 周六日
+            day_of_week_factor = weekday_factors['weekend']
+        elif current_date.weekday() == 4:  # 周五
+            day_of_week_factor = weekday_factors['friday']
+        elif current_date.weekday() == 0:  # 周一
+            day_of_week_factor = weekday_factors['monday']
+        
+        # 季节调整
+        season_factors = self.config.get('generation', 'season_factors')
+        if season == 1:  # 春季
+            season_factor = season_factors['spring']
+        elif season == 2:  # 夏季
+            season_factor = season_factors['summer']
+        elif season == 3:  # 秋季
+            season_factor = season_factors['autumn']
+        else:  # 冬季
+            season_factor = season_factors['winter']
+        
+        # 应用调整因子
+        self.daily_metrics['orders'] = int(self.daily_metrics['orders'] * 
+                                         holiday_factor * 
+                                         season_factor * 
+                                         day_of_week_factor)
+        self.daily_metrics['inventory_updates'] = int(self.daily_metrics['inventory_updates'] * 
+                                                     holiday_factor * 
+                                                     season_factor * 
+                                                     day_of_week_factor)
 
-    def _generate_related_data(self, current_date: datetime, growth_rates: Dict[str, int]) -> None:
-        """生成关联数据"""
-        # 生成订单项数据
-        for order_type in ['purchase_orders', 'sales_orders']:
-            base_count = growth_rates[order_type.rstrip('s')]
-            items_count = base_count * random.randint(1, 5)
-            
-            generator = (
-                self.generate_purchase_order_item_data if 'purchase' in order_type
-                else self.generate_sales_order_item_data
-            )
-            
-            items_data = [generator(current_date) for _ in range(items_count)]
-            self.save_to_mysql(items_data, f"{order_type.rstrip('s')}_items")
-            
-            self.stats['generated'][f"{order_type.rstrip('s')}_items"] = items_count
-
-    def _update_existing_data(self, current_date: datetime) -> None:
-        """更新现有数据"""
-        for table, id_field in [
-            ('users', 'user_id'),
-            ('employees', 'employee_id'),
-            ('products', 'product_id')
-        ]:
-            ids = self.query_from_db(f"SELECT {id_field} FROM {table} WHERE status <> 'deleted'")
-            if not ids:
-                continue
-                
-            update_count = min(len(ids), max(1, len(ids) * random.randint(1, 5) // 100))
-            updates = self._generate_updates(table, ids, update_count, current_date)
-            
-            self.update_mysql(updates, table, id_field)
-            self.stats['updated'][table] = update_count
-
-    def simulate_data(self) -> None:
-        """模拟生成数据的主函数"""
+    def generate_all_data(self, connection):
+        """生成所有数据"""
         current_date = self.start_time
         total_days = (self.end_time - self.start_time).days
-
+        commit_interval = self.config.get('performance', 'commit_interval', default=7)
+        
         try:
-            with tqdm(total=total_days, desc="Generating data") as pbar:
+            with tqdm(total=total_days, desc="生成数据") as pbar:
                 while current_date <= self.end_time:
-                    self.generate_daily_data(current_date)
-                    self._save_checkpoint(current_date)
+                    # 生成每日数据
+                    self._generate_daily_data(connection, current_date)
                     
+                    # 更新进度
                     current_date += timedelta(days=1)
                     pbar.update(1)
-                    time.sleep(self.frequency)
                     
-                # 输出最终统计信息
-                self._print_stats()
-                    
-        except KeyboardInterrupt:
-            logging.info("\nData generation interrupted by user")
-            self._save_checkpoint(current_date)
+                    # 定期提交事务
+                    if (current_date - self.start_time).days % commit_interval == 0:
+                        connection.commit()
+            
+            connection.commit()
+            
+            # 输出最终统计信息
+            self._print_stats()
+            
         except Exception as e:
-            logging.error(f"Error during data simulation: {e}")
-            self._save_checkpoint(current_date)
-        finally:
-            if hasattr(self, 'pool'):
-                self.pool.close()
-
-    def _print_stats(self) -> None:
-        """打印统计信息"""
-        logging.info("\nData Generation Statistics:")
-        logging.info("\nGenerated Records:")
-        for table, count in self.stats['generated'].items():
-            logging.info(f"  {table}: {count:,}")
-            
-        logging.info("\nUpdated Records:")
-        for table, count in self.stats['updated'].items():
-            logging.info(f"  {table}: {count:,}")
-            
-        if self.stats['errors']:
-            logging.info("\nErrors encountered:")
-            for error in self.stats['errors'][:10]:  # 只显示前10个错误
-                logging.info(f"  - {error}")
-            if len(self.stats['errors']) > 10:
-                logging.info(f"  ... and {len(self.stats['errors']) - 10} more errors")
-
-    def _init_db_pool(self) -> None:
-        """初始化数据库连接池"""
-        try:
-            self.pool = PooledDB(
-                creator=pymysql,
-                maxconnections=10,
-                mincached=2,
-                maxcached=5,
-                blocking=True,
-                maxshared=3,
-                setsession=[],
-                **self.db_config
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize database pool: {e}")
-
-    def _load_config_data(self) -> None:
-        """加载配置数据到内存"""
-        # 将原来的品牌、描述词等数据移到单独的配置文件或数据库中
-        self.brands = self._load_data_from_config('brands')
-        self.descriptors = self._load_data_from_config('descriptors')
-        self.categories = self._load_data_from_config('categories')
-        self.holiday_calendar = holidays.China()
-
-    @staticmethod
-    def _load_data_from_config(key: str) -> List[str]:
-        """
-        从配置文件加载数据
-        
-        Args:
-            key: 配置键名
-            
-        Returns:
-            配置数据列表
-        """
-        try:
-            return globals()[key.upper()]
-        except KeyError:
-            logging.warning(f"Configuration key {key} not found, using empty list")
-            return []
-
-    def _generate_updates(self, table: str, ids: List[int], count: int, current_date: datetime) -> List[Dict[str, Any]]:
-        """
-        生成数据更新
-        
-        Args:
-            table: 表名
-            ids: ID列表
-            count: 更新数量
-            current_date: 当前日期
-            
-        Returns:
-            更新数据列表
-        """
-        updates = []
-        selected_ids = random.sample(ids, min(count, len(ids)))
-        
-        for id_value in selected_ids:
-            if table == 'users':
-                update = {
-                    'user_id': id_value,
-                    'nickname': self.fake.first_name(),
-                    'email': self.fake.email(),
-                    'status': random.choice(["deleted", "active"]),
-                    'last_login': self.fake.date_time_between(
-                        current_date,
-                        current_date + timedelta(days=1)
-                    )
-                }
-            elif table == 'employees':
-                update = {
-                    'employee_id': id_value,
-                    'address': self.fake.address(),
-                    'phone': self.fake.phone_number(),
-                    'employment_status': random.choice(['active', 'inactive', 'resigned', 'on_leave', 'probation']),
-                    'last_login': self.fake.date_time_between(
-                        current_date,
-                        current_date + timedelta(days=1)
-                    )
-                }
-            elif table == 'products':
-                update = {
-                    'product_id': id_value,
-                    'price': round(random.uniform(10, 10000), 2),
-                    'cost_price': round(random.uniform(5, 1000), 2),
-                    'discount_price': round(random.uniform(5, 500), 2),
-                    'status': random.choice(['active', 'inactive', 'discontinued'])
-                }
-            
-            if self._validate_data(update, table.rstrip('s')):
-                updates.append(update)
-            
-        return updates
-
-    def generate_orders(self, connection, num_orders):
-        """生成订单数据"""
-        logger.info(f"开始生成 {num_orders} 个订单数据...")
-        
-        # 获取用户ID列表
-        cursor = connection.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        user_ids = [row[0] for row in cursor.fetchall()]
-        
-        if not user_ids:
-            logger.error("没有找到用户数据，请先生成用户数据")
-            return []
-        
-        orders = []
-        order_items = []
-        
-        now = datetime.now()
-        order_date_min = now - timedelta(days=365)  # 生成过去一年的订单
-        
-        for i in tqdm(range(num_orders), desc="生成订单"):
-            # 随机选择用户
-            user_id = random.choice(user_ids)
-            
-            # 生成订单日期
-            order_date = fake.date_time_between(start_date=order_date_min, end_date=now)
-            
-            # 根据订单日期确定状态
-            if order_date > now - timedelta(days=1):
-                status = random.choice(['pending', 'paid', 'shipped'])
-            elif order_date > now - timedelta(days=7):
-                status = random.choice(['shipped', 'completed'])
-            else:
-                status = random.choice(['completed', 'returned'])
-            
-            # 生成配送信息
-            shipping_fee = round(random.uniform(0, 50), 2)
-            total_amount = round(random.uniform(100, 10000), 2)
-            discount = round(random.uniform(0, total_amount * 0.3), 2)
-            
-            # 生成订单
-            order = {
-                'user_id': user_id,
-                'order_date': order_date,
-                'status': status,
-                'payment_method': random.choice(list(PAYMENT_METHODS.keys())),
-                'shipping_fee': shipping_fee,
-                'total_amount': total_amount,
-                'discount': discount,
-                'shipping_address': fake.address(),
-                'shipping_city': fake.city(),
-                'shipping_province': fake.province(),
-                'shipping_postal_code': fake.postcode(),
-                'shipping_region': random.choice(list(REGIONS.keys())),
-                'delivery_date': order_date + timedelta(days=random.randint(1, 7)) if status in ['shipped', 'completed'] else None
-            }
-            orders.append(order)
-            
-            # 生成订单项
-            num_items = random.randint(1, 5)
-            for _ in range(num_items):
-                # 获取产品信息
-                cursor.execute("SELECT product_id, price FROM products WHERE is_active = TRUE ORDER BY RAND() LIMIT 1")
-                product = cursor.fetchone()
-                if not product:
-                    continue
-                    
-                product_id, price = product
-                quantity = random.randint(1, 5)
-                item_discount = round(random.uniform(0, price * 0.2), 2)
-                
-                order_item = {
-                    'order_id': None,  # 将在插入订单后更新
-                    'product_id': product_id,
-                    'quantity': quantity,
-                    'price': price,
-                    'discount': item_discount,
-                    'total_price': (price - item_discount) * quantity,
-                    'is_gift': random.choice([True, False])
-                }
-                order_items.append(order_item)
-        
-        # 批量插入订单
-        try:
-            cursor = connection.cursor()
-            
-            # 插入订单
-            order_sql = """
-            INSERT INTO orders (user_id, order_date, status, payment_method, shipping_fee,
-                               total_amount, discount, shipping_address, shipping_city,
-                               shipping_province, shipping_postal_code, shipping_region,
-                               delivery_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            
-            order_values = [(
-                order['user_id'], order['order_date'], order['status'],
-                order['payment_method'], order['shipping_fee'], order['total_amount'],
-                order['discount'], order['shipping_address'], order['shipping_city'],
-                order['shipping_province'], order['shipping_postal_code'],
-                order['shipping_region'], order['delivery_date']
-            ) for order in orders]
-            
-            cursor.executemany(order_sql, order_values)
-            connection.commit()
-            
-            # 获取新插入的订单ID
-            cursor.execute("SELECT LAST_INSERT_ID()")
-            last_id = cursor.fetchone()[0]
-            first_id = last_id - len(orders) + 1
-            
-            # 更新订单项的order_id
-            for i, order_item in enumerate(order_items):
-                order_item['order_id'] = first_id + (i // 5)  # 假设每个订单平均5个商品
-            
-            # 插入订单项
-            item_sql = """
-            INSERT INTO order_items (order_id, product_id, quantity, price, discount,
-                                    total_price, is_gift)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """
-            
-            item_values = [(
-                item['order_id'], item['product_id'], item['quantity'],
-                item['price'], item['discount'], item['total_price'],
-                item['is_gift']
-            ) for item in order_items]
-            
-            cursor.executemany(item_sql, item_values)
-            connection.commit()
-            
-            logger.info(f"成功插入 {len(orders)} 个订单和 {len(order_items)} 个订单项")
-            
-        except Error as e:
-            logger.error(f"插入订单数据时发生错误: {e}")
+            logger.error(f"数据生成过程中发生错误: {e}")
             connection.rollback()
-        
-        return orders
-
-    def generate_inventory(self, connection):
-        """生成库存数据"""
-        logger.info("开始生成库存数据...")
-        
-        # 获取所有产品ID
-        cursor = connection.cursor()
-        cursor.execute("SELECT product_id FROM products WHERE is_active = TRUE")
-        product_ids = [row[0] for row in cursor.fetchall()]
-        
-        if not product_ids:
-            logger.error("没有找到产品数据，请先生成产品数据")
-            return []
-        
-        inventory_data = []
-        inventory_transactions = []
-        
-        now = datetime.now()
-        warehouse_locations = ['华东仓', '华北仓', '华南仓', '华中仓', '西南仓', '西北仓', '东北仓']
-        
-        for product_id in tqdm(product_ids, desc="生成库存"):
-            # 获取产品类别
-            cursor.execute(f"SELECT category FROM products WHERE product_id = {product_id}")
-            category = cursor.fetchone()[0]
-            
-            # 根据产品类别设置库存参数
-            turnover_rate = INVENTORY_TURNOVER_REFERENCE.get(category, 4.0)
-            low_stock_threshold = random.randint(10, 50)
-            reorder_quantity = random.randint(50, 200)
-            
-            # 生成初始库存
-            quantity = random.randint(100, 1000)
-            
-            # 生成库存记录
-            inventory = {
-                'product_id': product_id,
-                'quantity': quantity,
-                'low_stock_threshold': low_stock_threshold,
-                'reorder_quantity': reorder_quantity,
-                'last_restock_date': now - timedelta(days=random.randint(1, 30)),
-                'warehouse': random.choice(warehouse_locations)
-            }
-            inventory_data.append(inventory)
-            
-            # 生成库存交易记录
-            num_transactions = random.randint(5, 15)
-            transaction_date = now - timedelta(days=random.randint(1, 90))
-            
-            for _ in range(num_transactions):
-                transaction_type = random.choice(['入库', '出库', '调整'])
-                if transaction_type == '入库':
-                    transaction_quantity = random.randint(50, 200)
-                elif transaction_type == '出库':
-                    transaction_quantity = random.randint(10, 100)
-                else:  # 调整
-                    transaction_quantity = random.randint(-50, 50)
-                
-                transaction = {
-                    'product_id': product_id,
-                    'transaction_type': transaction_type,
-                    'quantity': transaction_quantity,
-                    'transaction_date': transaction_date,
-                    'order_id': None,  # 将在后续更新
-                    'notes': fake.sentence()
-                }
-                inventory_transactions.append(transaction)
-                
-                transaction_date += timedelta(days=random.randint(1, 7))
-        
-        # 批量插入库存数据
-        try:
-            cursor = connection.cursor()
-            
-            # 插入库存记录
-            inventory_sql = """
-            INSERT INTO inventory (product_id, quantity, low_stock_threshold,
-                                 reorder_quantity, last_restock_date, warehouse)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            
-            inventory_values = [(
-                inv['product_id'], inv['quantity'], inv['low_stock_threshold'],
-                inv['reorder_quantity'], inv['last_restock_date'], inv['warehouse']
-            ) for inv in inventory_data]
-            
-            cursor.executemany(inventory_sql, inventory_values)
-            connection.commit()
-            
-            # 插入库存交易记录
-            transaction_sql = """
-            INSERT INTO inventory_transactions (product_id, transaction_type,
-                                               quantity, transaction_date,
-                                               order_id, notes)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """
-            
-            transaction_values = [(
-                trans['product_id'], trans['transaction_type'],
-                trans['quantity'], trans['transaction_date'],
-                trans['order_id'], trans['notes']
-            ) for trans in inventory_transactions]
-            
-            cursor.executemany(transaction_sql, transaction_values)
-            connection.commit()
-            
-            logger.info(f"成功插入 {len(inventory_data)} 个库存记录和 {len(inventory_transactions)} 个库存交易记录")
-            
-        except Error as e:
-            logger.error(f"插入库存数据时发生错误: {e}")
-            connection.rollback()
-        
-        return inventory_data
+            raise
 
 def generate_users(connection, num_users):
     """生成用户数据"""
@@ -1272,66 +679,1047 @@ def generate_products(connection, num_products):
     
     return products
 
-def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description='生成销售数据仓库的模拟数据')
-    parser.add_argument('--users', type=int, default=DEFAULT_USERS,
-                      help=f'要生成的用户数量 (默认: {DEFAULT_USERS})')
-    parser.add_argument('--products', type=int, default=DEFAULT_PRODUCTS,
-                      help=f'要生成的产品数量 (默认: {DEFAULT_PRODUCTS})')
-    parser.add_argument('--orders', type=int, default=DEFAULT_ORDERS,
-                      help=f'要生成的订单数量 (默认: {DEFAULT_ORDERS})')
-    parser.add_argument('--days', type=int, default=DEFAULT_DAYS,
-                      help=f'要生成的天数 (默认: {DEFAULT_DAYS})')
-    parser.add_argument('--clear', action='store_true',
-                      help='在生成新数据前清空数据库')
-    
-    args = parser.parse_args()
-    
-    # 连接数据库
-    connection = connect_to_database()
-    if not connection:
-        logger.error("无法连接到数据库")
-        return
-    
-    try:
-        # 如果需要，清空数据库
-        if args.clear:
-            logger.info("清空数据库...")
-            clear_database(connection)
+class DataGenerator:
+    def __init__(self, db_config):
+        """初始化数据生成器"""
+        self.db_config = db_config
+        self.connection = None
+        self.cursor = None
+        self.dimension_data = {}  # 存储维表数据
+        self.connect()
+
+    def connect(self):
+        """建立数据库连接"""
+        try:
+            self.connection = mysql.connector.connect(**self.db_config)
+            self.cursor = self.connection.cursor()
+            logger.info("数据库连接成功")
+        except Error as e:
+            logger.error(f"数据库连接失败: {e}")
+            raise
+
+    def close(self):
+        """关闭数据库连接"""
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()
+            logger.info("数据库连接已关闭")
+
+    def generate_dimension_data(self):
+        """生成维表数据"""
+        try:
+            # 生成时间维表数据
+            self.generate_date_dimension()
+            
+            # 生成地区维表数据
+            self.generate_location_dimension()
+            
+            # 生成支付方式维表数据
+            self.generate_payment_method_dimension()
+            
+            # 生成商品类别维表数据
+            self.generate_product_category_dimension()
+            
+            # 生成供应商维表数据
+            self.generate_supplier_dimension()
+            
+            # 生成仓库维表数据
+            self.generate_warehouse_dimension()
+            
+            # 生成员工维表数据
+            self.generate_employee_dimension()
+            
+            # 生成客户维表数据
+            self.generate_customer_dimension()
+            
+            # 生成活动维表数据
+            self.generate_activity_dimension()
+            
+            logger.info("维表数据生成完成")
+        except Error as e:
+            logger.error(f"维表数据生成失败: {e}")
+            raise
+
+    def generate_date_dimension(self):
+        """生成时间维表数据"""
+        start_date = datetime.datetime.strptime(DIMENSION_DATA_GENERATION["dim_date"]["start_date"], "%Y-%m-%d")
+        end_date = datetime.datetime.strptime(DIMENSION_DATA_GENERATION["dim_date"]["end_date"], "%Y-%m-%d")
+        current_date = start_date
         
-        # 创建数据模拟器实例
-        simulator = DataSimulator(
-            db_config=DB_CONFIG,
-            start_time=datetime.now() - timedelta(days=args.days),
-            end_time=datetime.now()
+        while current_date <= end_date:
+            date_key = int(current_date.strftime("%Y%m%d"))
+            is_weekend = current_date.weekday() >= 5
+            is_holiday = current_date.strftime("%Y-%m-%d") in DIMENSION_DATA_GENERATION["dim_date"]["holidays"]
+            holiday_name = DIMENSION_DATA_GENERATION["dim_date"]["holidays"].get(current_date.strftime("%Y-%m-%d"))
+            
+            sql = """
+            INSERT INTO dim_date (
+                date_key, date, year, quarter, month, day,
+                day_of_week, day_of_year, week_of_year,
+                is_weekend, is_holiday, holiday_name, is_workday,
+                season, fiscal_year, fiscal_quarter, fiscal_month
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                date_key,
+                current_date.date(),
+                current_date.year,
+                (current_date.month - 1) // 3 + 1,
+                current_date.month,
+                current_date.day,
+                current_date.weekday() + 1,
+                current_date.timetuple().tm_yday,
+                current_date.isocalendar()[1],
+                is_weekend,
+                is_holiday,
+                holiday_name,
+                not is_weekend and not is_holiday,
+                self.get_season(current_date.month),
+                current_date.year,
+                (current_date.month - 1) // 3 + 1,
+                current_date.month
+            )
+            
+            self.cursor.execute(sql, values)
+            current_date += datetime.timedelta(days=1)
+        
+        self.connection.commit()
+        logger.info("时间维表数据生成完成")
+
+    def generate_location_dimension(self):
+        """生成地区维表数据"""
+        location_key = 1
+        for region, provinces in DIMENSION_DATA_GENERATION["dim_location"]["regions"].items():
+            for province in provinces:
+                # 为每个省份生成3-5个城市
+                for _ in range(random.randint(3, 5)):
+                    city = fake.city()
+                    # 为每个城市生成2-4个区
+                    for _ in range(random.randint(2, 4)):
+                        district = fake.district()
+                        # 为每个区生成3-5条街道
+                        for _ in range(random.randint(3, 5)):
+                            sql = """
+                            INSERT INTO dim_location (
+                                location_key, country, province, city, district,
+                                street, postal_code, region, latitude, longitude
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """
+                            
+                            values = (
+                                location_key,
+                                "中国",
+                                province,
+                                city,
+                                district,
+                                fake.street_name(),
+                                fake.postcode(),
+                                region,
+                                round(random.uniform(18.0, 53.0), 6),
+                                round(random.uniform(73.0, 135.0), 6)
+                            )
+                            
+                            self.cursor.execute(sql, values)
+                            location_key += 1
+        
+        self.connection.commit()
+        logger.info("地区维表数据生成完成")
+
+    def generate_payment_method_dimension(self):
+        """生成支付方式维表数据"""
+        for method in DIMENSION_DATA_GENERATION["dim_payment_method"]["methods"]:
+            sql = """
+            INSERT INTO dim_payment_method (
+                payment_method_key, payment_method_code,
+                payment_method_name, payment_type, description
+            ) VALUES (
+                %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                method["code"],
+                method["code"],
+                method["name"],
+                method["type"],
+                f"{method['name']}支付方式"
+            )
+            
+            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("支付方式维表数据生成完成")
+
+    def generate_product_category_dimension(self):
+        """生成商品类别维表数据"""
+        category_key = 1
+        for main_category, subcategories in DIMENSION_DATA_GENERATION["dim_product_category"]["categories"].items():
+            # 插入主类别
+            main_category_key = category_key
+            sql = """
+            INSERT INTO dim_product_category (
+                category_key, category_code, category_name,
+                category_level, category_path, description
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                main_category_key,
+                f"CAT_{main_category_key:03d}",
+                main_category,
+                1,
+                main_category,
+                f"{main_category}类别"
+            )
+            
+            self.cursor.execute(sql, values)
+            category_key += 1
+            
+            # 插入子类别
+            for subcategory, products in subcategories.items():
+                subcategory_key = category_key
+                sql = """
+                INSERT INTO dim_product_category (
+                    category_key, category_code, category_name,
+                    parent_category_key, category_level, category_path,
+                    description
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s
+                )
+                """
+                
+                values = (
+                    subcategory_key,
+                    f"CAT_{subcategory_key:03d}",
+                    subcategory,
+                    main_category_key,
+                    2,
+                    f"{main_category}/{subcategory}",
+                    f"{subcategory}类别"
+                )
+                
+                self.cursor.execute(sql, values)
+                category_key += 1
+                
+                # 插入具体产品类别
+                for product in products:
+                    sql = """
+                    INSERT INTO dim_product_category (
+                        category_key, category_code, category_name,
+                        parent_category_key, category_level, category_path,
+                        description
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """
+                    
+                    values = (
+                        category_key,
+                        f"CAT_{category_key:03d}",
+                        product,
+                        subcategory_key,
+                        3,
+                        f"{main_category}/{subcategory}/{product}",
+                        f"{product}类别"
+                    )
+                    
+                    self.cursor.execute(sql, values)
+                    category_key += 1
+        
+        self.connection.commit()
+        logger.info("商品类别维表数据生成完成")
+
+    def generate_supplier_dimension(self):
+        """生成供应商维表数据"""
+        for i in range(DIMENSION_DATA_GENERATION["dim_supplier"]["count"]):
+            supplier_type = random.choice(DIMENSION_DATA_GENERATION["dim_supplier"]["types"])
+            region = random.choice(list(REGIONS.keys()))
+            province = random.choice(REGIONS[region])
+            city = fake.city()
+            
+            sql = """
+            INSERT INTO dim_supplier (
+                supplier_key, supplier_code, supplier_name,
+                contact_name, contact_phone, contact_email,
+                address, city, province, postal_code, region,
+                business_license, tax_number, credit_rating
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s
+            )
+            """
+            
+            values = (
+                i + 1,
+                f"SUP_{i+1:03d}",
+                f"{supplier_type}{i+1}",
+                fake.name(),
+                fake.phone_number(),
+                fake.email(),
+                fake.address(),
+                city,
+                province,
+                fake.postcode(),
+                region,
+                f"BL_{i+1:08d}",
+                f"TN_{i+1:08d}",
+                random.choice(["A", "B", "C", "D"])
+            )
+            
+            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("供应商维表数据生成完成")
+
+    def generate_warehouse_dimension(self):
+        """生成仓库维表数据"""
+        for i in range(DIMENSION_DATA_GENERATION["dim_warehouse"]["count"]):
+            warehouse_type = random.choice(DIMENSION_DATA_GENERATION["dim_warehouse"]["types"])
+            region = random.choice(list(REGIONS.keys()))
+            province = random.choice(REGIONS[region])
+            city = fake.city()
+            
+            sql = """
+            INSERT INTO dim_warehouse (
+                warehouse_key, warehouse_code, warehouse_name,
+                warehouse_type, address, city, province,
+                postal_code, region, manager, contact_phone,
+                capacity
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                i + 1,
+                f"WH_{i+1:03d}",
+                f"{warehouse_type}{i+1}",
+                warehouse_type,
+                fake.address(),
+                city,
+                province,
+                fake.postcode(),
+                region,
+                fake.name(),
+                fake.phone_number(),
+                random.randint(1000, 10000)
+            )
+            
+            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("仓库维表数据生成完成")
+
+    def generate_employee_dimension(self):
+        """生成员工维表数据"""
+        for i in range(DIMENSION_DATA_GENERATION["dim_employee"]["count"]):
+            department = random.choice(DIMENSION_DATA_GENERATION["dim_employee"]["departments"])
+            position = random.choice(DIMENSION_DATA_GENERATION["dim_employee"]["positions"])
+            hire_date = fake.date_between(start_date="-5y", end_date="today")
+            
+            sql = """
+            INSERT INTO dim_employee (
+                employee_key, employee_code, employee_name,
+                department, position, hire_date, email,
+                phone, status
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                i + 1,
+                f"EMP_{i+1:03d}",
+                fake.name(),
+                department,
+                position,
+                hire_date,
+                fake.email(),
+                fake.phone_number(),
+                random.choice(["在职", "离职", "休假"])
+            )
+            
+            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("员工维表数据生成完成")
+
+    def generate_customer_dimension(self):
+        """生成客户维表数据"""
+        for i in range(DIMENSION_DATA_GENERATION["dim_customer"]["count"]):
+            customer_type = random.choice(DIMENSION_DATA_GENERATION["dim_customer"]["types"])
+            customer_level = random.choice(DIMENSION_DATA_GENERATION["dim_customer"]["levels"])
+            region = random.choice(list(REGIONS.keys()))
+            province = random.choice(REGIONS[region])
+            city = fake.city()
+            registration_date = fake.date_between(start_date="-3y", end_date="today")
+            
+            sql = """
+            INSERT INTO dim_customer (
+                customer_key, customer_code, customer_name,
+                customer_type, gender, birth_date, email,
+                phone, address, city, province, postal_code,
+                region, registration_date, customer_level,
+                points
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                i + 1,
+                f"CUS_{i+1:03d}",
+                fake.name(),
+                customer_type,
+                random.choice(["男", "女"]),
+                fake.date_of_birth(minimum_age=18, maximum_age=80),
+                fake.email(),
+                fake.phone_number(),
+                fake.address(),
+                city,
+                province,
+                fake.postcode(),
+                region,
+                registration_date,
+                customer_level,
+                random.randint(0, 10000)
+            )
+            
+            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("客户维表数据生成完成")
+
+    def get_season(self, month):
+        """获取季节"""
+        if 3 <= month <= 5:
+            return "春季"
+        elif 6 <= month <= 8:
+            return "夏季"
+        elif 9 <= month <= 11:
+            return "秋季"
+        else:
+            return "冬季"
+
+    def generate_activity_dimension(self):
+        """生成活动维表数据"""
+        activity_key = 1
+        start_date = datetime.datetime.strptime(DIMENSION_DATA_GENERATION["dim_date"]["start_date"], "%Y-%m-%d")
+        end_date = datetime.datetime.strptime(DIMENSION_DATA_GENERATION["dim_date"]["end_date"], "%Y-%m-%d")
+        current_date = start_date
+        
+        while current_date <= end_date:
+            # 检查是否有预定义的活动
+            month_day = current_date.strftime("%m-%d")
+            year = current_date.year
+            
+            # 检查大促活动
+            for activity_name, date_range in ACTIVITY_DATES["大促活动"].items():
+                if date_range["start"] <= month_day <= date_range["end"]:
+                    self._generate_activity(
+                        activity_key,
+                        activity_name,
+                        "大促活动",
+                        current_date,
+                        current_date + datetime.timedelta(days=random.randint(3, 7))
+                    )
+                    activity_key += 1
+            
+            # 检查节日活动
+            for activity_name, date_range in ACTIVITY_DATES["节日活动"].items():
+                if date_range["start"] <= month_day <= date_range["end"]:
+                    self._generate_activity(
+                        activity_key,
+                        activity_name,
+                        "节日活动",
+                        current_date,
+                        current_date + datetime.timedelta(days=random.randint(1, 3))
+                    )
+                    activity_key += 1
+            
+            # 随机生成其他类型的活动
+            if random.random() < 0.3:  # 30%的概率生成周末活动
+                if current_date.weekday() >= 5:  # 周末
+                    self._generate_activity(
+                        activity_key,
+                        f"周末特惠{current_date.strftime('%Y%m%d')}",
+                        "周末活动",
+                        current_date,
+                        current_date + datetime.timedelta(days=random.randint(1, 2))
+                    )
+                    activity_key += 1
+            
+            if random.random() < 0.5:  # 50%的概率生成日常活动
+                self._generate_activity(
+                    activity_key,
+                    f"每日特惠{current_date.strftime('%Y%m%d')}",
+                    "日常活动",
+                    current_date,
+                    current_date
+                )
+                activity_key += 1
+            
+            current_date += datetime.timedelta(days=1)
+        
+        self.connection.commit()
+        logger.info("活动维表数据生成完成")
+
+    def _generate_activity(self, activity_key, activity_name, activity_type, start_date, end_date):
+        """生成单个活动数据"""
+        activity_config = ACTIVITY_CONFIG["activity_types"][activity_type]
+        
+        # 计算活动状态
+        current_date = datetime.datetime.now()
+        if start_date > current_date:
+            status = "筹备中"
+        elif end_date < current_date:
+            status = "已结束"
+        else:
+            status = "进行中"
+        
+        # 生成活动数据
+        sql = """
+        INSERT INTO dim_activity (
+            activity_key, activity_code, activity_name,
+            activity_type, start_date, end_date,
+            status, channel, target_customer,
+            discount_rate, sales_increase_rate,
+            customer_increase_rate, views,
+            participants, conversion_rate,
+            avg_order_value, description
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        """
+        
+        # 生成活动指标
+        views = random.randint(*ACTIVITY_CONFIG["activity_metrics"]["views"])
+        participants = random.randint(*ACTIVITY_CONFIG["activity_metrics"]["participants"])
+        conversion_rate = random.uniform(*ACTIVITY_CONFIG["activity_metrics"]["conversion_rate"])
+        avg_order_value = random.uniform(*ACTIVITY_CONFIG["activity_metrics"]["avg_order_value"])
+        
+        values = (
+            activity_key,
+            f"ACT_{activity_key:06d}",
+            activity_name,
+            activity_type,
+            start_date,
+            end_date,
+            status,
+            random.choice(ACTIVITY_CONFIG["activity_channels"]),
+            random.choice(ACTIVITY_CONFIG["activity_targets"]),
+            random.uniform(*activity_config["discount_range"]),
+            random.uniform(*activity_config["sales_increase"]),
+            random.uniform(*activity_config["customer_increase"]),
+            views,
+            participants,
+            conversion_rate,
+            avg_order_value,
+            f"{activity_name}活动描述"
         )
         
-        # 生成基础数据
-        logger.info("开始生成基础数据...")
-        users = generate_users(connection, args.users)
-        suppliers = generate_suppliers(connection)
-        products = generate_products(connection, args.products)
+        self.cursor.execute(sql, values)
+
+    def generate_fact_data(self):
+        """生成事实表数据"""
+        try:
+            # 生成订单事实表数据
+            self.generate_order_facts()
+            
+            # 生成库存事实表数据
+            self.generate_inventory_facts()
+            
+            # 生成销售事实表数据
+            self.generate_sales_facts()
+            
+            # 生成活动事实表数据
+            self.generate_activity_facts()
+            
+            logger.info("事实表数据生成完成")
+        except Error as e:
+            logger.error(f"事实表数据生成失败: {e}")
+            raise
+
+    def generate_order_facts(self):
+        """生成订单事实表数据"""
+        # 获取维表数据
+        self.cursor.execute("SELECT date_key FROM dim_date")
+        date_keys = [row[0] for row in self.cursor.fetchall()]
         
-        # 生成订单和库存数据
-        logger.info("开始生成订单和库存数据...")
-        orders = simulator.generate_orders(connection, args.orders)
-        inventory = simulator.generate_inventory(connection)
+        self.cursor.execute("SELECT customer_key FROM dim_customer")
+        customer_keys = [row[0] for row in self.cursor.fetchall()]
         
-        # 输出统计信息
-        logger.info("\n数据生成完成！统计信息：")
-        logger.info(f"用户数量: {len(users)}")
-        logger.info(f"供应商数量: {len(suppliers)}")
-        logger.info(f"产品数量: {len(products)}")
-        logger.info(f"订单数量: {len(orders)}")
-        logger.info(f"库存记录数量: {len(inventory)}")
+        self.cursor.execute("SELECT employee_key FROM dim_employee")
+        employee_keys = [row[0] for row in self.cursor.fetchall()]
         
+        self.cursor.execute("SELECT payment_method_key FROM dim_payment_method")
+        payment_method_keys = [row[0] for row in self.cursor.fetchall()]
+        
+        self.cursor.execute("SELECT location_key FROM dim_location")
+        location_keys = [row[0] for row in self.cursor.fetchall()]
+        
+        # 生成订单数据
+        for _ in range(DEFAULT_ORDERS):
+            order_date_key = random.choice(date_keys)
+            customer_key = random.choice(customer_keys)
+            employee_key = random.choice(employee_keys)
+            payment_method_key = random.choice(payment_method_keys)
+            shipping_location_key = random.choice(location_keys)
+            
+            # 获取订单日期
+            self.cursor.execute(f"SELECT date FROM dim_date WHERE date_key = {order_date_key}")
+            order_date = self.cursor.fetchone()[0]
+            
+            # 生成订单状态
+            status = self.generate_order_status()
+            
+            # 生成订单金额
+            total_amount = round(random.uniform(100, 10000), 2)
+            shipping_fee = round(random.uniform(0, 50), 2)
+            discount = round(random.uniform(0, total_amount * 0.2), 2)
+            
+            sql = """
+            INSERT INTO orders (
+                order_date, customer_key, employee_key,
+                payment_method_key, shipping_location_key,
+                status, shipping_fee, total_amount, discount
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                order_date,
+                customer_key,
+                employee_key,
+                payment_method_key,
+                shipping_location_key,
+                status,
+                shipping_fee,
+                total_amount,
+                discount
+            )
+            
+            self.cursor.execute(sql, values)
+            order_id = self.cursor.lastrowid
+            
+            # 生成订单项数据
+            self.generate_order_items(order_id, total_amount)
+        
+        self.connection.commit()
+        logger.info("订单事实表数据生成完成")
+
+    def generate_inventory_facts(self):
+        """生成库存事实表数据"""
+        # 获取维表数据
+        self.cursor.execute("SELECT product_key, category FROM dim_product")
+        products = self.cursor.fetchall()
+        
+        self.cursor.execute("SELECT warehouse_key FROM dim_warehouse")
+        warehouse_keys = [row[0] for row in self.cursor.fetchall()]
+        
+        # 生成库存数据
+        for product_key, category in products:
+            for warehouse_key in warehouse_keys:
+                # 根据商品类别和周转率计算库存水平
+                turnover_rate = INVENTORY_TURNOVER_REFERENCE[category]
+                base_stock = random.randint(100, 1000)
+                quantity = int(base_stock / turnover_rate)
+                
+                # 设置库存预警阈值
+                low_stock_threshold = int(quantity * 0.2)  # 20%作为预警阈值
+                reorder_quantity = int(quantity * 0.5)  # 50%作为补货量
+                
+                # 生成最后补货时间
+                last_restock_date = fake.date_time_between(start_date="-1y", end_date="now")
+                
+                sql = """
+                INSERT INTO inventory (
+                    product_key, warehouse_key, quantity,
+                    low_stock_threshold, reorder_quantity,
+                    last_restock_date
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s
+                )
+                """
+                
+                values = (
+                    product_key,
+                    warehouse_key,
+                    quantity,
+                    low_stock_threshold,
+                    reorder_quantity,
+                    last_restock_date
+                )
+                
+                self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("库存事实表数据生成完成")
+
+    def generate_sales_facts(self):
+        """生成销售事实表数据"""
+        # 获取维表数据
+        self.cursor.execute("SELECT date_key, month FROM dim_date")
+        dates = self.cursor.fetchall()
+        
+        self.cursor.execute("SELECT product_key, category FROM dim_product")
+        products = self.cursor.fetchall()
+        
+        self.cursor.execute("SELECT customer_key, customer_type FROM dim_customer")
+        customers = self.cursor.fetchall()
+        
+        self.cursor.execute("SELECT employee_key FROM dim_employee")
+        employee_keys = [row[0] for row in self.cursor.fetchall()]
+        
+        # 生成销售数据
+        for date_key, month in dates:
+            seasonal_factor = SEASONAL_FACTORS[month - 1]
+            
+            for product_key, category in products:
+                for customer_key, customer_type in customers:
+                    # 根据客户类型和购买频率决定是否生成销售记录
+                    purchase_frequency = USER_PURCHASE_FREQUENCY[customer_type]
+                    if random.random() < purchase_frequency:
+                        for employee_key in random.sample(employee_keys, random.randint(1, 3)):
+                            # 基础数量
+                            base_quantity = random.randint(1, 10)
+                            
+                            # 应用季节性因子
+                            quantity = int(base_quantity * seasonal_factor)
+                            
+                            # 获取商品价格
+                            self.cursor.execute("""
+                                SELECT price FROM dim_product WHERE product_key = %s
+                            """, (product_key,))
+                            price = self.cursor.fetchone()[0]
+                            
+                            # 计算总金额
+                            total_amount = quantity * price
+                            
+                            sql = """
+                            INSERT INTO sales (
+                                date_key, product_key, customer_key,
+                                employee_key, quantity, unit_price,
+                                total_amount
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """
+                            
+                            values = (
+                                date_key,
+                                product_key,
+                                customer_key,
+                                employee_key,
+                                quantity,
+                                price,
+                                total_amount
+                            )
+                            
+                            self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("销售事实表数据生成完成")
+
+    def generate_activity_facts(self):
+        """生成活动事实表数据"""
+        # 获取活动数据
+        self.cursor.execute("""
+            SELECT activity_key, start_date, end_date, 
+                   discount_rate, sales_increase_rate, 
+                   customer_increase_rate
+            FROM dim_activity
+            WHERE status != '已取消'
+        """)
+        activities = self.cursor.fetchall()
+        
+        # 获取销售数据
+        self.cursor.execute("""
+            SELECT s.date_key, s.product_key, s.customer_key,
+                   s.employee_key, s.quantity, s.unit_price,
+                   s.total_amount
+            FROM sales s
+        """)
+        sales = self.cursor.fetchall()
+        
+        # 生成活动销售数据
+        for sale in sales:
+            sale_date = sale[0]
+            
+            # 检查销售日期是否在活动期间
+            for activity in activities:
+                activity_key, start_date, end_date, discount_rate, sales_increase, customer_increase = activity
+                
+                if start_date <= sale_date <= end_date:
+                    # 应用活动效果
+                    adjusted_quantity = int(sale[4] * sales_increase)
+                    adjusted_unit_price = round(sale[5] * (1 - discount_rate), 2)
+                    adjusted_total_amount = adjusted_quantity * adjusted_unit_price
+                    
+                    sql = """
+                    INSERT INTO activity_sales (
+                        activity_key, date_key, product_key,
+                        customer_key, employee_key, quantity,
+                        unit_price, total_amount, discount_amount
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """
+                    
+                    values = (
+                        activity_key,
+                        sale_date,
+                        sale[1],
+                        sale[2],
+                        sale[3],
+                        adjusted_quantity,
+                        adjusted_unit_price,
+                        adjusted_total_amount,
+                        sale[6] - adjusted_total_amount
+                    )
+                    
+                    self.cursor.execute(sql, values)
+        
+        self.connection.commit()
+        logger.info("活动事实表数据生成完成")
+
+    def generate_order_items(self, order_id, total_amount):
+        """生成订单项数据"""
+        # 获取商品数据
+        self.cursor.execute("""
+            SELECT p.product_key, p.price, p.category
+            FROM dim_product p
+            ORDER BY RAND() LIMIT 1
+        """)
+        product = self.cursor.fetchone()
+        
+        if product:
+            product_key, price, category = product
+            # 使用配置的数量范围
+            min_quantity, max_quantity = ORDER_QUANTITY_RANGE[category]
+            quantity = random.randint(min_quantity, max_quantity)
+            
+            # 应用季节性因子
+            self.cursor.execute("""
+                SELECT d.month
+                FROM orders o
+                JOIN dim_date d ON o.order_date = d.date
+                WHERE o.order_id = %s
+            """, (order_id,))
+            month = self.cursor.fetchone()[0]
+            seasonal_factor = SEASONAL_FACTORS[month - 1]
+            
+            # 调整价格和数量
+            adjusted_price = price * seasonal_factor
+            adjusted_quantity = int(quantity * seasonal_factor)
+            
+            # 计算折扣
+            discount = round(random.uniform(0, adjusted_price * 0.1), 2)
+            total_price = adjusted_quantity * (adjusted_price - discount)
+            
+            sql = """
+            INSERT INTO order_items (
+                order_id, product_key, quantity,
+                price, discount, total_price
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s
+            )
+            """
+            
+            values = (
+                order_id,
+                product_key,
+                adjusted_quantity,
+                adjusted_price,
+                discount,
+                total_price
+            )
+            
+            self.cursor.execute(sql, values)
+
+    def generate_order_status(self):
+        """根据配置生成订单状态"""
+        status_probability = random.random()
+        if status_probability < ORDER_STATUS['已取消']:
+            return "已取消"
+        elif status_probability < ORDER_STATUS['已支付']:
+            return "已支付"
+        elif status_probability < ORDER_STATUS['已发货']:
+            return "已发货"
+        elif status_probability < ORDER_STATUS['已完成']:
+            return "已完成"
+        elif status_probability < ORDER_STATUS['已退货']:
+            return "已退货"
+        else:
+            return "处理中"
+
+    def validate_generated_data(self):
+        """验证生成的数据是否符合配置要求"""
+        try:
+            # 验证订单状态分布
+            self._validate_order_status_distribution()
+            
+            # 验证库存周转率
+            self._validate_inventory_turnover()
+            
+            # 验证用户购买频率
+            self._validate_user_purchase_frequency()
+            
+            # 验证活动效果
+            self._validate_activity_effects()
+            
+            logger.info("数据验证完成")
+        except DataValidationError as e:
+            logger.error(f"数据验证失败: {e}")
+            raise
+
+    def _validate_order_status_distribution(self):
+        """验证订单状态分布"""
+        self.cursor.execute("""
+            SELECT status, COUNT(*) as count
+            FROM orders
+            GROUP BY status
+        """)
+        status_counts = dict(self.cursor.fetchall())
+        total_orders = sum(status_counts.values())
+        
+        for status, expected_prob in ORDER_STATUS.items():
+            if status in status_counts:
+                actual_prob = status_counts[status] / total_orders
+                if abs(actual_prob - expected_prob) > 0.1:  # 允许10%的偏差
+                    raise DataValidationError(
+                        f"订单状态 {status} 的分布不符合预期: "
+                        f"期望概率 {expected_prob}, 实际概率 {actual_prob}"
+                    )
+
+    def _validate_inventory_turnover(self):
+        """验证库存周转率"""
+        self.cursor.execute("""
+            SELECT p.category, 
+                   COUNT(DISTINCT i.product_key) as product_count,
+                   SUM(i.quantity) as total_quantity,
+                   COUNT(DISTINCT s.product_key) as sold_products,
+                   SUM(s.quantity) as total_sold
+            FROM inventory i
+            JOIN dim_product p ON i.product_key = p.product_key
+            LEFT JOIN sales s ON i.product_key = s.product_key
+            GROUP BY p.category
+        """)
+        
+        for category, product_count, total_quantity, sold_products, total_sold in self.cursor.fetchall():
+            if product_count > 0:
+                turnover_rate = total_sold / total_quantity if total_quantity > 0 else 0
+                expected_turnover = INVENTORY_TURNOVER_REFERENCE.get(category, 0)
+                
+                if abs(turnover_rate - expected_turnover) > 0.2:  # 允许20%的偏差
+                    raise DataValidationError(
+                        f"商品类别 {category} 的库存周转率不符合预期: "
+                        f"期望周转率 {expected_turnover}, 实际周转率 {turnover_rate}"
+                    )
+
+    def _validate_user_purchase_frequency(self):
+        """验证用户购买频率"""
+        self.cursor.execute("""
+            SELECT c.customer_type,
+                   COUNT(DISTINCT o.order_id) as order_count,
+                   COUNT(DISTINCT o.customer_key) as customer_count
+            FROM orders o
+            JOIN dim_customer c ON o.customer_key = c.customer_key
+            GROUP BY c.customer_type
+        """)
+        
+        for customer_type, order_count, customer_count in self.cursor.fetchall():
+            if customer_count > 0:
+                avg_frequency = order_count / customer_count
+                expected_frequency = USER_PURCHASE_FREQUENCY.get(customer_type, 0)
+                
+                if abs(avg_frequency - expected_frequency) > 0.2:  # 允许20%的偏差
+                    raise DataValidationError(
+                        f"客户类型 {customer_type} 的购买频率不符合预期: "
+                        f"期望频率 {expected_frequency}, 实际频率 {avg_frequency}"
+                    )
+
+    def _validate_activity_effects(self):
+        """验证活动效果"""
+        self.cursor.execute("""
+            SELECT a.activity_type,
+                   COUNT(DISTINCT as.activity_key) as activity_count,
+                   AVG(as.discount_amount) as avg_discount,
+                   AVG(as.quantity) as avg_quantity,
+                   AVG(as.total_amount) as avg_amount
+            FROM activity_sales as
+            JOIN dim_activity a ON as.activity_key = a.activity_key
+            GROUP BY a.activity_type
+        """)
+        
+        for activity_type, activity_count, avg_discount, avg_quantity, avg_amount in self.cursor.fetchall():
+            if activity_count > 0:
+                activity_config = ACTIVITY_CONFIG["activity_types"].get(activity_type, {})
+                
+                # 验证折扣率
+                if activity_config.get("discount_range"):
+                    min_discount, max_discount = activity_config["discount_range"]
+                    if not (min_discount <= avg_discount <= max_discount):
+                        raise DataValidationError(
+                            f"活动类型 {activity_type} 的折扣率不符合预期: "
+                            f"期望范围 [{min_discount}, {max_discount}], "
+                            f"实际值 {avg_discount}"
+                        )
+                
+                # 验证销量提升
+                if activity_config.get("sales_increase"):
+                    min_increase, max_increase = activity_config["sales_increase"]
+                    if not (min_increase <= avg_quantity <= max_increase):
+                        raise DataValidationError(
+                            f"活动类型 {activity_type} 的销量提升不符合预期: "
+                            f"期望范围 [{min_increase}, {max_increase}], "
+                            f"实际值 {avg_quantity}"
+                        )
+
+    def generate_data(self):
+        """生成所有数据"""
+        try:
+            # 生成维表数据
+            self.generate_dimension_data()
+            
+            # 生成事实表数据
+            self.generate_fact_data()
+            
+            # 验证生成的数据
+            self.validate_generated_data()
+            
+            logger.info("所有数据生成完成")
+        except Error as e:
+            logger.error(f"数据生成失败: {e}")
+            raise
+        finally:
+            self.close()
+
+def main():
+    """主函数"""
+    try:
+        # 创建数据生成器实例
+        generator = DataGenerator(DB_CONFIG)
+        
+        # 生成数据
+        generator.generate_data()
+        
+        logger.info("数据生成成功")
     except Exception as e:
-        logger.error(f"数据生成过程中发生错误: {e}")
-        connection.rollback()
-    finally:
-        connection.close()
-        logger.info("数据库连接已关闭")
+        logger.error(f"程序执行失败: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
