@@ -8,3 +8,5 @@ argparse==1.4.0
 pymysql==1.0.3
 sqlalchemy==2.0.7
 loguru==0.6.0
+chinese-calendar==1.8.0
+PyYAML==6.0.1
