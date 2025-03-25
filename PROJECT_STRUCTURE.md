@@ -33,7 +33,7 @@
 ## 数据流程
 
 1. **数据生成**: 使用Python和Faker库生成模拟的购销数据
-2. **数据抽取**: 通过DataX将MySQL中的数据抽取到Hive的ODS层
+2. **数据抽取**: 通过Spark SQL将MySQL中的数据抽取到Hive的ODS层
 3. **数据转换**: 通过Spark SQL将ODS数据转换为DWD和DWS层数据
 4. **数据同步**: 将Hive中的汇总数据同步到Doris，用于快速查询
 5. **数据查询**: 通过Spring Boot开发的API服务查询Doris中的数据
