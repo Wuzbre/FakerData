@@ -158,8 +158,8 @@ class PromotionGenerator(BaseGenerator):
                             0,                          # participant_count
                             0,                          # order_count
                             0.0,                        # total_discount_amount
-                            datetime.now(),             # created_at
-                            datetime.now()              # updated_at
+                            promotion_start,             # created_at
+                            promotion_start              # updated_at
                         ))
                         
                         # 存储促销信息供后续使用
@@ -221,8 +221,8 @@ class PromotionGenerator(BaseGenerator):
                                 0,                          # participant_count
                                 0,                          # order_count
                                 0.0,                        # total_discount_amount
-                                datetime.now(),             # created_at
-                                datetime.now()              # updated_at
+                                promotion_start,             # created_at
+                                promotion_start              # updated_at
                             ))
                             
                             # 存储促销信息供后续使用

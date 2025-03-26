@@ -2,7 +2,7 @@ import random
 from datetime import datetime, timedelta
 from decimal import Decimal
 from ..base_generator import BaseGenerator
-from ..config import INVENTORY_TURNOVER, SEASONAL_PRODUCTS
+from ..config import INVENTORY_TURNOVER, SEASONAL_PRODUCTS, START_DATE
 
 class InventoryGenerator(BaseGenerator):
     def __init__(self, product_info, order_details, category_seasons):
@@ -12,6 +12,7 @@ class InventoryGenerator(BaseGenerator):
         self.category_seasons = category_seasons
         self.inventory_logs = []
         self.price_histories = []
+        self.start_date = datetime.strptime(START_DATE, '%Y-%m-%d')
 
     def generate_initial_inventory(self):
         """生成初始库存记录"""
@@ -31,7 +32,7 @@ class InventoryGenerator(BaseGenerator):
                 None,                       # related_order_id
                 'system',                   # operator
                 '初始库存入库',              # remark
-                datetime.now()              # created_at
+                self.start_date             # created_at
             ))
 
             # 生成初始价格记录
@@ -42,7 +43,7 @@ class InventoryGenerator(BaseGenerator):
                 info['price'],              # new_price
                 'initial',                  # change_reason
                 'system',                   # operator
-                datetime.now()              # created_at
+                self.start_date             # created_at
             ))
 
         # 批量插入初始库存记录
@@ -95,7 +96,7 @@ class InventoryGenerator(BaseGenerator):
                     order_id,               # related_order_id
                     'system',               # operator
                     '订单出库',              # remark
-                    datetime.now()          # created_at
+                    details['order_time']   # created_at
                 ))
 
         # 批量插入库存变动记录

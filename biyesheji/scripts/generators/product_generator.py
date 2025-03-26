@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from ..base_generator import BaseGenerator
 from ..config import (
     PRODUCT_POPULARITY, SEASONAL_PRODUCTS, INVENTORY_TURNOVER,
-    REGIONS, DATA_CONFIG
+    REGIONS, DATA_CONFIG, START_DATE
 )
 
 class ProductGenerator(BaseGenerator):
@@ -11,6 +11,7 @@ class ProductGenerator(BaseGenerator):
         super().__init__()
         self.product_ids = []
         self.product_info = {}  # 存储商品的详细信息，用于后续订单生成
+        self.start_date = datetime.strptime(START_DATE, '%Y-%m-%d')
 
     def _generate_product_name(self, category_name, brand_name):
         """根据分类和品牌生成商品名称"""
@@ -189,8 +190,8 @@ class ProductGenerator(BaseGenerator):
                     0,                             # sales_volume
                     0.0,                           # sales_amount
                     5.0,                           # avg_rating
-                    datetime.now(),                # created_at
-                    datetime.now()                 # updated_at
+                    self.start_date,               # created_at
+                    self.start_date                # updated_at
                 ))
                 
                 # 存储商品信息供后续使用

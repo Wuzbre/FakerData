@@ -254,8 +254,8 @@ class OrderGenerator(BaseGenerator):
                             is_promotion_price,      # is_promotion_price
                             rating,                  # rating
                             review,                  # review
-                            datetime.now(),          # create_time
-                            datetime.now()           # update_time
+                            order_time,              # create_time
+                            order_time               # update_time
                         ))
                 
                 if order_products:  # 只有当有商品被购买时才创建订单
@@ -281,8 +281,8 @@ class OrderGenerator(BaseGenerator):
                         weather,                     # weather
                         delivery_days,               # delivery_days
                         0,                          # is_first_order
-                        datetime.now(),              # created_at
-                        datetime.now()               # updated_at
+                        order_time,                  # created_at
+                        order_time                   # updated_at
                     ))
                     
                     self.order_ids.append(order_id)
@@ -330,8 +330,8 @@ class OrderGenerator(BaseGenerator):
                 is_promotion_price,          # is_promotion_price
                 rating,                      # rating
                 review,                      # review
-                create_time,                 # created_at
-                update_time                  # updated_at
+                order_time,                  # created_at
+                order_time                   # updated_at
             ))
         
         self.batch_insert('order_detail', detail_columns, new_detail_values)
